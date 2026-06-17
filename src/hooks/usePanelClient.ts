@@ -41,6 +41,7 @@ export function usePanelClient(uris: PanelUris) {
       history: Turn[];
       enable_thinking: boolean;
       hint_format: string;
+      hint_text: string;
       n_frames: number;
     }) => call<AskResult>("ask", uris.ask, params),
     [call, uris.ask]

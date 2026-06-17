@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { usePanelClient } from "./hooks/usePanelClient";
@@ -26,6 +26,8 @@ interface StoredSession {
   enableThinking: boolean;
   hintFormat: string;
   nFrames: number;
+  /** Per-format edits to the format instruction; empty unless customized. */
+  hintTexts?: Record<string, string>;
 }
 
 function loadSession(sampleId: string): StoredSession | null {
@@ -150,6 +152,19 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   // "auto" = let the model decide; other values append a JSON-shape suffix.
   const [hintFormat, setHintFormat] = useState("auto");
   const [nFrames, setNFrames] = useState(8);
+  // Per-format edits to the format instruction; absence = use the default.
+  const [hintTexts, setHintTexts] = useState<Record<string, string>>({});
+  const [hintEditing, setHintEditing] = useState(false);
+
+  // Format-instruction templates are owned by Python (prompts.JSON_SHAPE_BY_FORMAT)
+  // and pushed via data.hint_templates — the single source of truth.
+  const hintTemplates = useMemo(
+    () => data?.hint_templates ?? {},
+    [data?.hint_templates]
+  );
+  // The instruction text for the current output style (edited or default).
+  const currentHintText =
+    hintFormat === "auto" ? "" : (hintTexts[hintFormat] ?? hintTemplates[hintFormat] ?? "");
 
   // Streaming state for the active (in-progress) turn.
   const [streamState,   setStreamState]   = useState<StreamState>("idle");
@@ -194,6 +209,8 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     setPromptTok(null);
     setCompletionTok(null);
     setTurnSaveStates({});
+    setHintEditing(false);
+    setHintTexts({});
     runIdRef.current  = "";
     cursorRef.current = 0;
     chunkCountRef.current = 0;
@@ -205,6 +222,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
       setEnableThinking(cached.enableThinking);
       setHintFormat(cached.hintFormat ?? "auto");
       setNFrames(cached.nFrames ?? 8);
+      setHintTexts(cached.hintTexts ?? {});
     } else {
       setTurns([]);
     }
@@ -213,8 +231,8 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   // ── Persist turns ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!sampleId) return;
-    saveSession(sampleId, { turns, enableThinking, hintFormat, nFrames });
-  }, [turns, enableThinking, hintFormat, nFrames, sampleId]);
+    saveSession(sampleId, { turns, enableThinking, hintFormat, nFrames, hintTexts });
+  }, [turns, enableThinking, hintFormat, nFrames, hintTexts, sampleId]);
 
   // ── Stream polling ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -302,8 +320,10 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     const historyForApi = [...turns];
     setTurns((prev) => [...prev, { role: "user", content: q }]);
 
+    // currentHintText is already "" when hintFormat is "auto".
     log("ask →", { filepath, media_type: mediaType, history_len: historyForApi.length,
-                    enable_thinking: enableThinking, hint_format: hintFormat, n_frames: nFrames });
+                    enable_thinking: enableThinking, hint_format: hintFormat,
+                    hint_text_len: currentHintText.length, n_frames: nFrames });
 
     try {
       const result = await ask({
@@ -313,6 +333,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
         history:         historyForApi,
         enable_thinking: enableThinking,
         hint_format:     hintFormat,
+        hint_text:       currentHintText,
         n_frames:        nFrames,
       });
       log("ask ← run_id:", result.run_id);
@@ -322,7 +343,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
       setStreamError(e?.message ?? "Request failed.");
       setStreamState("error");
     }
-  }, [question, streamState, filepath, mediaType, turns, enableThinking, hintFormat, nFrames, ask]);
+  }, [question, streamState, filepath, mediaType, turns, enableThinking, hintFormat, currentHintText, nFrames, ask]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -550,7 +571,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
             <span style={{ flexShrink: 0 }}>Output:</span>
             <select
               value={hintFormat}
-              onChange={(e) => setHintFormat(e.target.value)}
+              onChange={(e) => { setHintFormat(e.target.value); setHintEditing(false); }}
               style={{
                 background: V.bg2, color: V.text,
                 border: `1px solid ${V.divider}`, borderRadius: 4,
@@ -593,6 +614,76 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
             </div>
           )}
         </div>
+
+        {/* ── Format-instruction preview / editor ── */}
+        {hintFormat === "auto" ? (
+          <div style={{ fontSize: 10, color: V.dim, fontStyle: "italic", padding: "0 2px" }}>
+            Auto — no format instruction is added; the model decides the output shape.
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 5,
+                        background: V.bg, border: `1px solid ${V.divider}`,
+                        borderRadius: 6, padding: "6px 8px" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <span style={{ fontSize: 10, color: V.dim, textTransform: "uppercase",
+                             letterSpacing: "0.04em" }}>
+                Instruction appended to your question
+              </span>
+              <button
+                onClick={() => setHintEditing((v) => !v)}
+                title={hintEditing ? "Finish editing" : "Edit the format instruction"}
+                style={{ background: "none", border: "none", cursor: "pointer", color: V.primary,
+                         fontSize: 11, display: "flex", alignItems: "center", gap: 3,
+                         padding: 0, fontFamily: V.font, flexShrink: 0 }}
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
+                </svg>
+                {hintEditing ? "Done" : "Edit"}
+              </button>
+            </div>
+
+            {hintEditing ? (
+              <>
+                <textarea
+                  value={currentHintText}
+                  onChange={(e) =>
+                    setHintTexts((prev) => ({ ...prev, [hintFormat]: e.target.value }))
+                  }
+                  rows={3}
+                  spellCheck={false}
+                  style={{
+                    width: "100%", background: V.bg2, color: V.text,
+                    border: `1px solid ${V.divider}`, borderRadius: 4,
+                    padding: "6px 8px", fontSize: 11, fontFamily: "ui-monospace, monospace",
+                    lineHeight: 1.5, outline: "none", resize: "vertical" as const,
+                    boxSizing: "border-box" as const,
+                  }}
+                />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <button
+                    onClick={() =>
+                      setHintTexts((prev) => ({
+                        ...prev,
+                        [hintFormat]: hintTemplates[hintFormat] ?? "",
+                      }))
+                    }
+                    style={{ background: "none", border: "none", cursor: "pointer",
+                             color: V.dim, fontSize: 10, textDecoration: "underline",
+                             padding: 0, fontFamily: V.font }}
+                  >
+                    Reset to default
+                  </button>
+                </div>
+              </>
+            ) : (
+              <code style={{ fontSize: 11, color: V.muted, fontFamily: "ui-monospace, monospace",
+                             lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                {currentHintText}
+              </code>
+            )}
+          </div>
+        )}
 
         <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
           <textarea

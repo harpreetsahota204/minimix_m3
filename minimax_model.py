@@ -33,7 +33,7 @@ from .minimax_api import (
     DEFAULT_MODEL_ID,
     MiniMaxClient,
     build_frame_strip_content,
-    encode_image,
+    encode_image_with_size,
     sample_video_frames,
 )
 from .minimax_parser import FOLabel, to_fiftyone
@@ -196,7 +196,8 @@ class MiniMaxModel(Model):
 
     def _predict_image(self, filepath: str, sample: fo.Sample | None = None) -> FOLabel:
         prompt = self._resolve_prompt(sample)
-        content = _image_content(prompt, encode_image(filepath))
+        image_url, image_size = encode_image_with_size(filepath)
+        content = _image_content(prompt, image_url)
         logger.info(
             "[minimax_m3] predict (image-mode): task=%s target=%r path=%s prompt=%r",
             self._config.task.value,
@@ -206,7 +207,9 @@ class MiniMaxModel(Model):
         )
         response = self._chat(content)
         text = response.choices[0].message.content or ""
-        label = to_fiftyone(text, self.parser_format, target=self._config.target)
+        label = to_fiftyone(
+            text, self.parser_format, target=self._config.target, image_size=image_size
+        )
         logger.info("[minimax_m3] predict produced %s", _typename(label))
         return label
 
@@ -263,7 +266,12 @@ class MiniMaxModel(Model):
         for f in frames:
             response = self._chat(_image_content(prompt, f["url"]))
             text = response.choices[0].message.content or ""
-            label = to_fiftyone(text, parser_format, target=self._config.target)
+            label = to_fiftyone(
+                text,
+                parser_format,
+                target=self._config.target,
+                image_size=(f["w"], f["h"]),
+            )
             if isinstance(label, fo.Detections):
                 for det in label.detections:
                     det["t"] = f["t"]

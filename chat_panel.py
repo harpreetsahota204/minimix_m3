@@ -52,9 +52,11 @@ from .minimax_api import (
     DEFAULT_TOP_K,
     build_frame_strip_content,
     encode_image,
+    encode_image_with_size,
     sample_video_frames,
 )
 from .minimax_parser import to_fiftyone
+from .prompts import JSON_SHAPE_BY_FORMAT
 
 logger = logging.getLogger("minimax_m3")
 
@@ -62,20 +64,11 @@ logger = logging.getLogger("minimax_m3")
 # FiftyOne's plugin cache (writing inside the dir changes its mtime).
 _STATUS_DIR = Path.home() / ".fiftyone" / "minimax_chat"
 
-# JSON-shape suffixes appended to a question when the user picks an output hint.
-_HINT_SUFFIXES: dict[str, str] = {
-    "box": (
-        ' Return ONLY JSON: [{"label": str, "box": [x1, y1, x2, y2]}] with '
-        "NORMALIZED [0,1] coordinates (top-left / bottom-right)."
-    ),
-    "point": (
-        ' Return ONLY JSON: [{"label": str, "point": [x, y]}] with '
-        "NORMALIZED [0,1] coordinates."
-    ),
-    "temporal": (
-        ' Return ONLY JSON: [{"label": str, "start": <seconds>, "end": <seconds>}].'
-    ),
-}
+# JSON-shape instructions the panel surfaces and lets the user edit; the edited
+# text is sent back as `hint_text`. Sourced verbatim from
+# `prompts.JSON_SHAPE_BY_FORMAT` so the panel and the operator demand the exact
+# same shape (single source of truth).
+_HINT_TEMPLATES: dict[str, str] = dict(JSON_SHAPE_BY_FORMAT)
 
 # Default output field names shown in the Convert UI, one per format.
 _DEFAULT_FIELDS: dict[str, str] = {
@@ -259,6 +252,7 @@ class MiniMaxChatPanel(foo.Panel):
 
     def on_load(self, ctx):
         ctx.panel.set_state("api_key_missing", not has_api_key(ctx))
+        ctx.panel.set_state("hint_templates", _HINT_TEMPLATES)
         self._sync_sample(ctx)
 
     def on_change_current_sample(self, ctx):
@@ -319,7 +313,8 @@ class MiniMaxChatPanel(foo.Panel):
 
         Parameters (via ctx.params): filepath, media_type, question, history,
         enable_thinking (bool -> adaptive/disabled), hint_format
-        ("auto"|"box"|"point"|"temporal"), n_frames.
+        ("auto"|"box"|"point"|"temporal"), hint_text (the editable format
+        instruction; overrides the default suffix), n_frames.
         """
         if not has_api_key(ctx):
             return {"error": "HF_TOKEN is not set."}
@@ -330,6 +325,7 @@ class MiniMaxChatPanel(foo.Panel):
         history: list[dict] = ctx.params.get("history", [])
         enable_thinking = bool(ctx.params.get("enable_thinking", False))
         hint_format = ctx.params.get("hint_format", "auto")
+        hint_text = (ctx.params.get("hint_text") or "").strip()
         n_frames = int(ctx.params.get("n_frames") or 8)
 
         if not question:
@@ -337,11 +333,14 @@ class MiniMaxChatPanel(foo.Panel):
         if not filepath:
             return {"error": "No filepath provided."}
 
-        # Steer M3's output shape by appending a JSON-shape suffix to the new
-        # question when a non-auto hint is selected.
+        # Steer M3's output shape by appending a format instruction to the new
+        # question. Prefer the user-edited `hint_text`; fall back to the default
+        # suffix for the selected format; "auto" appends nothing.
         question_to_send = question
-        if hint_format and hint_format != "auto" and hint_format in _HINT_SUFFIXES:
-            question_to_send = question + _HINT_SUFFIXES[hint_format]
+        if hint_text:
+            question_to_send = f"{question}\n\n{hint_text}"
+        elif hint_format and hint_format != "auto" and hint_format in _HINT_TEMPLATES:
+            question_to_send = f"{question} {_HINT_TEMPLATES[hint_format]}"
 
         media_parts = _build_media_parts(filepath, media_type, n_frames)
 
@@ -441,13 +440,28 @@ class MiniMaxChatPanel(foo.Panel):
         try:
             content = stream_file.read_text(encoding="utf-8")
             fr = float(frame_rate) if frame_rate else None
-            label = to_fiftyone(content, fmt, frame_rate=fr)
 
+            field_is_new = field not in ctx.dataset.get_field_schema()
             sample = ctx.dataset[sample_id]
+
+            # For spatial formats on image samples, pass the encoded image size
+            # so the parser can normalize any pixel-space coordinates M3 emits.
+            image_size = None
+            if fmt in ("box", "point") and getattr(sample, "media_type", "image") != "video":
+                image_size = encode_image_with_size(sample.filepath)[1]
+
+            label = to_fiftyone(content, fmt, frame_rate=fr, image_size=image_size)
+
             sample[field] = label
             sample.save()
 
-            ctx.ops.reload_samples()
+            # A brand-new field needs a full dataset reload so the App picks up
+            # the schema change; reload_samples() alone leaves it invisible
+            # until a manual refresh.
+            if field_is_new:
+                ctx.ops.reload_dataset()
+            else:
+                ctx.ops.reload_samples()
 
             label_type = type(label).__name__
             count = _count_label_items(label)

@@ -46,6 +46,8 @@ export interface PanelData {
   media_type?: string;
   frame_rate?: number | null;
   api_key_missing?: boolean;
+  /** Default, editable format-instruction text per output style (from Python). */
+  hint_templates?: Record<string, string>;
 }
 
 export interface PanelSchema {

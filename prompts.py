@@ -136,25 +136,35 @@ TASKS_TEMPORAL: Final[frozenset[Task]] = frozenset(
 # Default user-prompt templates. Every grounded task demands "ONLY JSON".
 # ---------------------------------------------------------------------------
 
-# JSON-shape suffixes appended to grounding prompts. M3 returns NORMALIZED
-# [0, 1] coordinates, which the parser consumes directly (COORD_SCALE = 1.0).
+# JSON-shape suffixes appended to grounding prompts. Kept VERBATIM (modulo the
+# task instruction prefix) with the proven prompts in ``explore_minimax_m3.py``
+# so the model formats output exactly as the vibe-check reference expects. M3
+# returns NORMALIZED [0, 1] coordinates, consumed directly (COORD_SCALE = 1.0).
 _BOX_JSON_SHAPE: Final[str] = (
-    'Return ONLY JSON (no prose): a list like '
-    '[{"label": "dog", "box": [x1, y1, x2, y2]}] '
+    "Return ONLY JSON: a list like\n"
+    '[{"label": "dog", "box": [x1, y1, x2, y2]}]\n'
     "where box is NORMALIZED in [0, 1], (x1,y1)=top-left, (x2,y2)=bottom-right."
 )
 _POINT_JSON_SHAPE: Final[str] = (
-    'Return ONLY JSON (no prose): a list like '
-    '[{"label": str, "point": [x, y]}] with NORMALIZED [0, 1] coordinates.'
+    'Return ONLY JSON: [{"label": str, "point": [x, y]}] with '
+    "NORMALIZED [0,1] coordinates."
 )
 _TEMPORAL_JSON_SHAPE: Final[str] = (
-    'Return ONLY JSON (no prose): a list like '
-    '[{"label": str, "start": <seconds>, "end": <seconds>}].'
+    'Return ONLY JSON: [{"label": str, "start": <sec>, "end": <sec>}].'
 )
 _CLASSIFY_JSON_SHAPE: Final[str] = (
     'Return ONLY JSON (no prose) with this shape: '
     '{"classifications": [{"label": str, "confidence": <0..1 float>}]}.'
 )
+
+# Public, parser-format-keyed view of the grounding shape suffixes. The chat
+# panel surfaces these as its editable "output style" instructions so the panel
+# and the operator demand the exact same JSON shape (single source of truth).
+JSON_SHAPE_BY_FORMAT: Final[dict[str, str]] = {
+    "box": _BOX_JSON_SHAPE,
+    "point": _POINT_JSON_SHAPE,
+    "temporal": _TEMPORAL_JSON_SHAPE,
+}
 
 
 def _detect_template(target: str | None, media_type: str) -> str:
@@ -163,8 +173,13 @@ def _detect_template(target: str | None, media_type: str) -> str:
 
 
 def _keypoints_template(target: str | None, media_type: str) -> str:
-    subject = f"each {target}" if target else "notable points (object centers / distinctive parts)"
-    return f"Point to {subject} in this {media_type}. {_POINT_JSON_SHAPE}"
+    # No-target image case is verbatim with explore_minimax_m3.probe_keypoints.
+    if target:
+        return f"Identify each {target} in this {media_type}. {_POINT_JSON_SHAPE}"
+    return (
+        f"Identify notable points in this {media_type} (e.g. object centers or "
+        f"distinctive parts). {_POINT_JSON_SHAPE}"
+    )
 
 
 _FIND_EVENT_TEMPLATE: Final[str] = (

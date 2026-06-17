@@ -7,8 +7,9 @@ Thin OpenAI-compatible client targeted at the Hugging Face Inference router
 * `MiniMaxClient.chat_completion(...)` -- one shot of `/chat/completions` with
   M3's recommended sampling (``temperature=1.0, top_p=0.95, top_k=40``) and the
   ``thinking`` object passed via ``extra_body``. Retries on 429.
-* `encode_image(...)` / `to_image_data_uri(...)` -- base64-encode local images
-  into the ``data:image/jpeg;base64,...`` URI the API requires.
+* `encode_image(...)` / `encode_image_with_size(...)` -- base64-encode a local
+  image into the ``data:image/jpeg;base64,...`` URI the API requires (the
+  ``_with_size`` variant also returns the encoded ``(w, h)``).
 * `sample_video_frames(...)` -- evenly sample N frames from a local video with
   OpenCV, returning each frame's timestamp (seconds), 1-indexed frame number,
   and a base64 data URI.
@@ -83,24 +84,25 @@ def _pil_to_jpeg_data_uri(img: Image.Image, *, quality: int = 90) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def encode_image_with_size(
+    filepath: str | Path, *, max_side: int = DEFAULT_IMAGE_MAX_SIDE
+) -> tuple[str, tuple[int, int]]:
+    """Read a local image, downscale, and return ``(jpeg_data_uri, (w, h))``.
+
+    The returned ``(w, h)`` is the size of the *encoded* image the model sees,
+    which the parser needs to normalize any pixel-space coordinates M3 returns.
+    """
+    img = _downscale(Image.open(filepath).convert("RGB"), max_side)
+    return _pil_to_jpeg_data_uri(img), img.size
+
+
 def encode_image(filepath: str | Path, *, max_side: int = DEFAULT_IMAGE_MAX_SIDE) -> str:
     """Read a local image, optionally downscale, and return a JPEG data URI.
 
     Downscaling to ``max_side`` (longest side) keeps payloads small; M3 returns
     NORMALIZED coordinates so the resize doesn't affect downstream parsing.
     """
-    img = _downscale(Image.open(filepath).convert("RGB"), max_side)
-    return _pil_to_jpeg_data_uri(img)
-
-
-def to_image_data_uri(data: bytes, *, mime: str = "image/jpeg") -> str:
-    """Encode raw image bytes as a ``data:<mime>;base64,...`` URI.
-
-    Used by the chat panel (which holds raw bytes) and any caller that already
-    has encoded image bytes.
-    """
-    b64 = base64.b64encode(data).decode("ascii")
-    return f"data:{mime};base64,{b64}"
+    return encode_image_with_size(filepath, max_side=max_side)[0]
 
 
 def sample_video_frames(
@@ -113,11 +115,13 @@ def sample_video_frames(
 
     Returns ``(frames, fps, total_frames)`` where each ``frames`` entry is::
 
-        {"t": <seconds>, "frame_no": <1-indexed int>, "url": <jpeg data URI>}
+        {"t": <seconds>, "frame_no": <1-indexed int>, "url": <jpeg data URI>,
+         "w": <encoded px width>, "h": <encoded px height>}
 
     The 1-indexed ``frame_no`` matches FiftyOne's frame numbering so callers
-    can write directly to ``sample.frames[frame_no]``. Mirrors the notebook's
-    ``sample_frames`` helper.
+    can write directly to ``sample.frames[frame_no]``; ``w`` / ``h`` are the
+    encoded frame size, used to normalize any pixel-space coordinates M3
+    returns. Mirrors the notebook's ``sample_frames`` helper.
     """
     cap = cv2.VideoCapture(str(filepath))
     try:
@@ -137,6 +141,8 @@ def sample_video_frames(
                     "t": float(i) / fps,
                     "frame_no": int(i) + 1,
                     "url": _pil_to_jpeg_data_uri(img, quality=85),
+                    "w": img.size[0],
+                    "h": img.size[1],
                 }
             )
     finally:
