@@ -1,0 +1,469 @@
+"""MiniMax-M3 Chat Panel — ask questions about the current image or video.
+
+Architecture
+------------
+A hybrid modal panel. Python lifecycle hooks push the current sample's
+filepath and media type to React via ``ctx.panel.set_state()``. The React
+component calls three panel methods:
+
+    ``ask``             — validates params, starts an inference daemon thread
+                          that streams tokens to a file, returns a run_id.
+    ``get_stream_chunk``— reads new bytes from the stream file since the
+                          caller's last cursor position; React polls every
+                          250 ms to produce a live typing effect.
+    ``save_as_label``   — parses the completed stream as JSON using
+                          minimax_parser and saves the resulting FiftyOne label
+                          to the sample. Only offered when the response looked
+                          like a recognised JSON grounding shape.
+
+Streaming runs in a daemon thread that writes token chunks to an append-only
+file under ``~/.fiftyone/minimax_chat/`` and lifecycle state to a sibling JSON
+file. This file-based IPC is required because FiftyOne reimports the plugin
+module on every panel-method call.
+
+Video handling: M3 has no native video input on the HF router, so video
+samples are frame-sampled (see ``minimax_api.sample_video_frames``) and the
+timestamped frame strip is embedded in the first user message.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Any
+
+import bson
+from openai import OpenAI
+
+import fiftyone.operators as foo
+import fiftyone.operators.types as types
+from fiftyone import ViewField as F
+
+from ._shared import get_api_key, has_api_key
+from .minimax_api import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL_ID,
+    DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_TOP_K,
+    build_frame_strip_content,
+    encode_image,
+    sample_video_frames,
+)
+from .minimax_parser import to_fiftyone
+
+logger = logging.getLogger("minimax_m3")
+
+# Runtime files live OUTSIDE the plugin directory to avoid invalidating
+# FiftyOne's plugin cache (writing inside the dir changes its mtime).
+_STATUS_DIR = Path.home() / ".fiftyone" / "minimax_chat"
+
+# JSON-shape suffixes appended to a question when the user picks an output hint.
+_HINT_SUFFIXES: dict[str, str] = {
+    "box": (
+        ' Return ONLY JSON: [{"label": str, "box": [x1, y1, x2, y2]}] with '
+        "NORMALIZED [0,1] coordinates (top-left / bottom-right)."
+    ),
+    "point": (
+        ' Return ONLY JSON: [{"label": str, "point": [x, y]}] with '
+        "NORMALIZED [0,1] coordinates."
+    ),
+    "temporal": (
+        ' Return ONLY JSON: [{"label": str, "start": <seconds>, "end": <seconds>}].'
+    ),
+}
+
+# Default output field names shown in the Convert UI, one per format.
+_DEFAULT_FIELDS: dict[str, str] = {
+    "box": "m3_detections",
+    "point": "m3_keypoints",
+    "temporal": "m3_events",
+}
+
+
+def _stream_path(run_id: str) -> Path:
+    return _STATUS_DIR / f".stream_{run_id}.txt"
+
+
+def _status_path(run_id: str) -> Path:
+    return _STATUS_DIR / f".status_{run_id}.json"
+
+
+def _ensure_dir() -> None:
+    _STATUS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _write_json(path: Path, data: dict) -> None:
+    _ensure_dir()
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _append_stream(run_id: str, text: str) -> None:
+    _ensure_dir()
+    with open(_stream_path(run_id), "a", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+
+
+def _clear_run(run_id: str) -> None:
+    for p in (_stream_path(run_id), _status_path(run_id)):
+        p.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Format detection (JSON shapes)
+# ---------------------------------------------------------------------------
+
+
+def _detect_format(content: str) -> str | None:
+    """Detect a JSON grounding shape from a completed response.
+
+    Priority: temporal (start+end) > box > point. Returns ``None`` for plain
+    text, which hides the Convert button.
+    """
+    if re.search(r'"start"\s*:', content) and re.search(r'"end"\s*:', content):
+        return "temporal"
+    if re.search(r'"(?:box|bbox|bbox_2d|bounding_box)"\s*:', content):
+        return "box"
+    if re.search(r'"point"\s*:', content):
+        return "point"
+    return None
+
+
+def _count_label_items(label: Any) -> int:
+    if hasattr(label, "detections"):
+        return len(label.detections)
+    if hasattr(label, "keypoints"):
+        return len(label.keypoints)
+    if hasattr(label, "classifications"):
+        return len(label.classifications)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Media part construction
+# ---------------------------------------------------------------------------
+
+
+def _build_media_parts(filepath: str, media_type: str, n_frames: int) -> list[dict[str, Any]]:
+    """Return the OpenAI content parts representing the media.
+
+    For images, a single ``image_url`` part. For videos, a timestamped frame
+    strip (text marker + ``image_url`` per sampled frame).
+    """
+    if media_type == "video":
+        frames, _fps, _total = sample_video_frames(filepath, n=n_frames)
+        # build_frame_strip_content prepends a text prompt; drop that here and
+        # keep only the frame parts so the caller can place the question last.
+        parts = build_frame_strip_content("", frames)
+        return parts[1:]  # skip the empty leading text part
+    return [{"type": "image_url", "image_url": {"url": encode_image(filepath)}}]
+
+
+# ---------------------------------------------------------------------------
+# Inference thread
+# ---------------------------------------------------------------------------
+
+
+def _run_stream_thread(
+    api_key: str,
+    messages: list[dict[str, Any]],
+    thinking: str,
+    run_id: str,
+) -> None:
+    """Stream an M3 chat completion and write tokens to the stream file."""
+    _write_json(_status_path(run_id), {"status": "streaming", "start_time": time.time()})
+    try:
+        client = OpenAI(api_key=api_key, base_url=DEFAULT_BASE_URL, timeout=DEFAULT_TIMEOUT_SECONDS)
+
+        stream = client.chat.completions.create(
+            model=DEFAULT_MODEL_ID,
+            messages=messages,
+            stream=True,
+            stream_options={"include_usage": True},
+            temperature=1.0,
+            top_p=0.95,
+            max_tokens=1500,
+            extra_body={"top_k": DEFAULT_TOP_K, "thinking": {"type": thinking}},
+        )
+
+        t0 = time.time()
+        prompt_tokens = completion_tokens = 0
+
+        for chunk in stream:
+            choice = chunk.choices[0] if chunk.choices else None
+            delta = getattr(choice, "delta", None) if choice else None
+            if delta and getattr(delta, "content", None):
+                _append_stream(run_id, delta.content)
+            if getattr(chunk, "usage", None):
+                prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
+
+        try:
+            full_content = _stream_path(run_id).read_text(encoding="utf-8")
+        except OSError:
+            full_content = ""
+        detected_format = _detect_format(full_content)
+
+        _write_json(_status_path(run_id), {
+            "status": "done",
+            "latency_ms": int((time.time() - t0) * 1000),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "detected_format": detected_format,
+            "default_field": _DEFAULT_FIELDS.get(detected_format, "") if detected_format else "",
+        })
+
+    except Exception:
+        tb = traceback.format_exc()
+        _write_json(_status_path(run_id), {"status": "error", "error": tb})
+        logger.error("[minimax_m3] chat stream error:\n%s", tb)
+
+
+# ---------------------------------------------------------------------------
+# Panel
+# ---------------------------------------------------------------------------
+
+
+class MiniMaxChatPanel(foo.Panel):
+    """Modal panel for asking questions about the current image or video."""
+
+    @property
+    def config(self):
+        return foo.PanelConfig(
+            name="minimax_chat",
+            label="Ask MiniMax-M3",
+            surfaces="modal",
+            help_markdown=(
+                "Ask free-form questions about the current image or video. "
+                "Responses stream live from MiniMax-M3. Use the output hint to "
+                "steer M3 toward boxes / keypoints / temporal JSON you can save "
+                "as FiftyOne labels."
+            ),
+        )
+
+    # ── Lifecycle hooks ──────────────────────────────────────────────────────
+
+    def on_load(self, ctx):
+        ctx.panel.set_state("api_key_missing", not has_api_key(ctx))
+        self._sync_sample(ctx)
+
+    def on_change_current_sample(self, ctx):
+        self._sync_sample(ctx)
+
+    def on_change_group_slice(self, ctx):
+        self._sync_sample(ctx)
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _sync_sample(self, ctx) -> None:
+        if not ctx.current_sample:
+            return
+
+        dataset = ctx.dataset
+        sample = dataset[ctx.current_sample]
+        gf = dataset.group_field
+
+        resolved = sample
+        filepath = sample.filepath
+        sample_id = ctx.current_sample
+        media_type = getattr(sample, "media_type", None) or "image"
+
+        if gf and ctx.group_slice:
+            group_elem = sample[gf]
+            if group_elem and group_elem.name != ctx.group_slice:
+                try:
+                    slice_sample = (
+                        dataset
+                        .select_group_slices(ctx.group_slice)
+                        .match(F(f"{gf}._id") == bson.ObjectId(group_elem.id))
+                        .first()
+                    )
+                    if slice_sample is not None:
+                        resolved = slice_sample
+                        filepath = slice_sample.filepath
+                        sample_id = slice_sample.id
+                        media_type = getattr(slice_sample, "media_type", None) or "image"
+                except Exception as exc:
+                    logger.warning("[minimax_m3] group-slice lookup error: %s", exc)
+
+        frame_rate: float | None = None
+        meta = resolved.metadata
+        if meta is not None:
+            raw_fr = getattr(meta, "frame_rate", None)
+            if raw_fr:
+                frame_rate = float(raw_fr)
+
+        ctx.panel.set_state("filepath", filepath)
+        ctx.panel.set_state("sample_id", sample_id)
+        ctx.panel.set_state("media_type", media_type)
+        ctx.panel.set_state("frame_rate", frame_rate)
+
+    # ── Panel methods (called from React via usePanelEvent) ──────────────────
+
+    def ask(self, ctx) -> dict:
+        """Start a streaming inference and return a run_id for React to poll.
+
+        Parameters (via ctx.params): filepath, media_type, question, history,
+        enable_thinking (bool -> adaptive/disabled), hint_format
+        ("auto"|"box"|"point"|"temporal"), n_frames.
+        """
+        if not has_api_key(ctx):
+            return {"error": "HF_TOKEN is not set."}
+
+        filepath = ctx.params.get("filepath", "")
+        media_type = ctx.params.get("media_type", "image")
+        question = (ctx.params.get("question") or "").strip()
+        history: list[dict] = ctx.params.get("history", [])
+        enable_thinking = bool(ctx.params.get("enable_thinking", False))
+        hint_format = ctx.params.get("hint_format", "auto")
+        n_frames = int(ctx.params.get("n_frames") or 8)
+
+        if not question:
+            return {"error": "Question cannot be empty."}
+        if not filepath:
+            return {"error": "No filepath provided."}
+
+        # Steer M3's output shape by appending a JSON-shape suffix to the new
+        # question when a non-auto hint is selected.
+        question_to_send = question
+        if hint_format and hint_format != "auto" and hint_format in _HINT_SUFFIXES:
+            question_to_send = question + _HINT_SUFFIXES[hint_format]
+
+        media_parts = _build_media_parts(filepath, media_type, n_frames)
+
+        # Build the messages array. The media is embedded in the first user
+        # message only; subsequent turns are text.
+        messages: list[dict[str, Any]] = []
+        if not history:
+            messages.append({
+                "role": "user",
+                "content": [*media_parts, {"type": "text", "text": question_to_send}],
+            })
+        else:
+            first_user_injected = False
+            for turn in history:
+                if turn["role"] == "user" and not first_user_injected:
+                    messages.append({
+                        "role": "user",
+                        "content": [*media_parts, {"type": "text", "text": turn["content"]}],
+                    })
+                    first_user_injected = True
+                else:
+                    messages.append({"role": turn["role"], "content": turn["content"]})
+            if not first_user_injected:
+                messages.append({
+                    "role": "user",
+                    "content": [*media_parts, {"type": "text", "text": question_to_send}],
+                })
+            else:
+                messages.append({"role": "user", "content": question_to_send})
+
+        thinking = "adaptive" if enable_thinking else "disabled"
+
+        run_id = f"{ctx.current_sample or 'x'}_{int(time.time() * 1000)}"
+        _clear_run(run_id)
+
+        thread = threading.Thread(
+            target=_run_stream_thread,
+            kwargs=dict(
+                api_key=get_api_key(ctx),
+                messages=messages,
+                thinking=thinking,
+                run_id=run_id,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return {"status": "started", "run_id": run_id}
+
+    def get_stream_chunk(self, ctx) -> dict:
+        run_id = ctx.params.get("run_id", "")
+        cursor = int(ctx.params.get("cursor", 0))
+
+        try:
+            with open(_stream_path(run_id), "rb") as f:
+                f.seek(cursor)
+                new_bytes = f.read()
+            new_cursor = cursor + len(new_bytes)
+            new_text = new_bytes.decode("utf-8", errors="replace")
+        except (FileNotFoundError, OSError):
+            new_text = ""
+            new_cursor = cursor
+
+        status = _read_json(_status_path(run_id)) or {}
+        done = status.get("status") in ("done", "error")
+
+        return {
+            "text": new_text,
+            "cursor": new_cursor,
+            "done": done,
+            "final_status": status if done else None,
+        }
+
+    def save_as_label(self, ctx) -> dict:
+        """Parse a completed stream as JSON and save it as a FiftyOne label."""
+        run_id = ctx.params.get("run_id", "")
+        sample_id = ctx.params.get("sample_id", "")
+        field = (ctx.params.get("field_name") or "").strip()
+        fmt = ctx.params.get("detected_format", "")
+        frame_rate = ctx.params.get("frame_rate")
+
+        if not run_id:
+            return {"error": "No run_id provided."}
+        if not sample_id:
+            return {"error": "No sample_id provided."}
+        if not field:
+            return {"error": "Field name is required."}
+        if not fmt:
+            return {"error": "No detected format — nothing to convert."}
+
+        stream_file = _stream_path(run_id)
+        if not stream_file.exists():
+            return {"error": (
+                f"Stream file for run '{run_id}' no longer exists. "
+                "Re-ask the question to generate a new stream."
+            )}
+
+        try:
+            content = stream_file.read_text(encoding="utf-8")
+            fr = float(frame_rate) if frame_rate else None
+            label = to_fiftyone(content, fmt, frame_rate=fr)
+
+            sample = ctx.dataset[sample_id]
+            sample[field] = label
+            sample.save()
+
+            ctx.ops.reload_samples()
+
+            label_type = type(label).__name__
+            count = _count_label_items(label)
+            return {"saved": True, "label_type": label_type, "count": count, "field": field}
+
+        except Exception as exc:
+            return {"error": f"Parse / save failed: {exc}"}
+
+    def render(self, ctx):
+        return types.Property(
+            types.Object(),
+            view=types.View(
+                component="MiniMaxChatPanel",
+                composite_view=True,
+                ask=self.ask,
+                get_stream_chunk=self.get_stream_chunk,
+                save_as_label=self.save_as_label,
+            ),
+        )

@@ -1,0 +1,14 @@
+name: "@harpreetsahota/minimax-m3"
+type: plugin
+version: "0.1.0"
+author: "Harpreet Sahota"
+license: "Apache-2.0"
+description: "MiniMax-M3 integration for FiftyOne — detection, keypoints, captioning, classification, VQA, temporal events, and chat, via the Hugging Face Inference router."
+fiftyone:
+  version: ">=0.22.0"
+operators:
+  - run_minimax
+panels:
+  - minimax_chat
+secrets:
+  - HF_TOKEN

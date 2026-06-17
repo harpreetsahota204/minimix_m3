@@ -1,0 +1,14 @@
+{
+  "name": "harpreetsahota/minimax-m3",
+  "url": "https://github.com/harpreetsahota204/minimax-m3-fiftyone",
+  "models": [
+    {
+      "base_name": "minimax/minimax-m3",
+      "base_filename": "minimax_m3.marker",
+      "author": "MiniMax",
+      "license": "Apache-2.0 (model) / API access via Hugging Face Inference",
+      "description": "MiniMax-M3 (\"M3\") -- a native multimodal model (~428B params, ~23B active, 1M context) served through the Hugging Face Inference router (OpenAI-compatible). Supports captioning, structured JSON, bounding boxes, keypoints, classification, VQA on images, plus per-frame detection and temporal event detection on video via frame sampling.",
+      "tags": ["minimax", "m3", "vision", "video", "detection", "keypoints", "vqa", "captioning", "classification", "temporal"]
+    }
+  ]
+}
