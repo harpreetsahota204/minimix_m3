@@ -33,6 +33,7 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import dataclass, field as dataclass_field
 from typing import Any
 
 import fiftyone as fo
@@ -833,6 +834,97 @@ def _render_execution_mode(inputs: Any, ctx: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _RunOutcome:
+    """The mode-specific result of a run, produced after the predict loop.
+
+    Carries everything the shared runner needs to finish: the custom-run
+    ``summary`` payload, the Markdown ``summary_md`` for the output panel, the
+    App toast (``notify_message`` / ``notify_variant``), the final progress
+    ``status`` line, and any ``view_ops`` (``ctx.ops.*`` results) to yield.
+    """
+
+    summary: dict[str, Any]
+    summary_md: str
+    notify_message: str
+    final_status: str
+    notify_variant: str = "success"
+    view_ops: list[Any] = dataclass_field(default_factory=list)
+
+
+def _usage_summary(model: MiniMaxModel, elapsed_s: float) -> dict[str, Any]:
+    """The token / call / elapsed fields shared by every mode's run summary."""
+    usage = model.usage_totals
+    return {
+        "elapsed_seconds": round(elapsed_s, 2),
+        "api_calls": usage["calls"],
+        "prompt_tokens": usage["prompt_tokens"],
+        "completion_tokens": usage["completion_tokens"],
+        "total_tokens": usage["total_tokens"],
+    }
+
+
+async def _run_mode(
+    ctx: Any,
+    version: str,
+    logbuf: _ProgressLogBuffer,
+    *,
+    view: Any,
+    mode_value: str,
+    mode_label: str,
+    operation: str,
+    start_notify: str,
+    start_status: str,
+    model: MiniMaxModel,
+    on_sample: Callable[[fo.Sample, Any, int], str],
+    finalize: Callable[[float], _RunOutcome],
+) -> AsyncIterator[dict[str, Any]]:
+    """Drive the shared per-mode run lifecycle.
+
+    Handles the boilerplate every mode shares -- start toast / progress, log
+    draining, usage reset, the predict-with-progress loop, custom-run
+    registration, the success toast, view ops, and the final progress + result.
+    The mode supplies its ``on_sample`` writeback and a ``finalize`` callback
+    that computes the post-run ``_RunOutcome``.
+    """
+    total = len(view)
+    notify(ctx, start_notify)
+    yield _yield_progress(ctx, mode_label=mode_label, status=start_status, done=0, total=total)
+
+    for msg in _drain_log_buffer(ctx, logbuf):
+        yield msg
+    model.reset_usage_totals()
+
+    started_at = time.perf_counter()
+    async for msg in _predict_with_progress(
+        ctx, view, model=model, mode_label=mode_label, logbuf=logbuf,
+        started_at=started_at, on_sample=on_sample,
+    ):
+        yield msg
+
+    elapsed_s = time.perf_counter() - started_at
+    outcome = finalize(elapsed_s)
+
+    run_key = _register_custom_run(
+        ctx, version=version, operation=operation, summary=outcome.summary
+    )
+
+    notify(ctx, outcome.notify_message, variant=outcome.notify_variant)
+    for op in outcome.view_ops:
+        yield op
+    yield _yield_progress(
+        ctx, mode_label=mode_label, status=outcome.final_status,
+        done=total, total=total, model=model, started_at=started_at,
+    )
+
+    yield {
+        "mode": mode_value,
+        "summary": outcome.summary_md,
+        "run_key": run_key,
+        "elapsed_seconds": round(elapsed_s, 2),
+    }
+
+
 async def _execute_event_search(
     ctx: Any, version: str, logbuf: _ProgressLogBuffer
 ) -> AsyncIterator[dict[str, Any]]:
@@ -845,18 +937,7 @@ async def _execute_event_search(
 
     view = ctx.target_view()
     total = len(view)
-    notify(ctx, f"Searching {total} video(s) for event '{query}'...")
-
-    yield _yield_progress(
-        ctx, mode_label="Event Search", status=f"Starting on {total} video(s)...", done=0, total=total
-    )
-
     model = _build_model(ctx, task=Task.FIND_EVENT, target=query)
-    for msg in _drain_log_buffer(ctx, logbuf):
-        yield msg
-    model.reset_usage_totals()
-
-    started_at = time.perf_counter()
     counters = {"clips": 0, "matched": 0}
 
     def on_sample(sample: fo.Sample, label: Any, _i: int) -> str:
@@ -867,74 +948,57 @@ async def _execute_event_search(
             counters["matched"] += 1
         return f"{counters['matched']} match(es), {counters['clips']} clip(s)"
 
-    async for msg in _predict_with_progress(
-        ctx, view, model=model, mode_label="Event Search", logbuf=logbuf,
-        started_at=started_at, on_sample=on_sample,
+    def finalize(elapsed_s: float) -> _RunOutcome:
+        clips_view = ctx.dataset.to_clips(field)
+        n_matched_clips = len(clips_view)
+        n_matched_samples = len(
+            ctx.dataset.match(F(field) != None).match(  # noqa: E711
+                F(f"{field}.detections").length() > 0
+            )
+        )
+        usage = model.usage_totals
+        summary_md = (
+            f"**Event Search** completed.  \n"
+            f"- Query: `{query}`  \n"
+            f"- Matched: **{n_matched_samples}** / {total} videos "
+            f"(**{n_matched_clips}** event clip(s))  \n"
+            f"- Output field: `{field}`  \n"
+            f"- Elapsed: **{_format_elapsed(elapsed_s)}** across **{usage['calls']}** API call(s)  \n"
+            f"- Tokens: **{usage['prompt_tokens']:,}** in / **{usage['completion_tokens']:,}** out  \n"
+            f"- View auto-switched to a clips view, one row per detected event."
+        )
+        return _RunOutcome(
+            summary={
+                "mode": MODE_EVENT_SEARCH,
+                "query": query,
+                "field": field,
+                "n_total": total,
+                "n_matched_samples": n_matched_samples,
+                "n_matched_clips": n_matched_clips,
+                "n_temporal_detections": counters["clips"],
+                **_usage_summary(model, elapsed_s),
+            },
+            summary_md=summary_md,
+            notify_message=(
+                f"Event Search done: {n_matched_clips} clip(s) across "
+                f"{n_matched_samples}/{total} video(s)."
+            ),
+            final_status=(
+                f"Complete -- {n_matched_clips} clip(s) across "
+                f"{n_matched_samples}/{total} video(s)."
+            ),
+            view_ops=[ctx.ops.set_view(view=clips_view), ctx.ops.reload_samples()],
+        )
+
+    async for msg in _run_mode(
+        ctx, version, logbuf,
+        view=view, mode_value=MODE_EVENT_SEARCH, mode_label="Event Search",
+        operation="event_search",
+        start_notify=f"Searching {total} video(s) for event '{query}'...",
+        start_status=f"Starting on {total} video(s)...",
+        model=model, on_sample=on_sample, finalize=finalize,
     ):
         yield msg
-
-    n_clips = counters["clips"]
-    elapsed_s = time.perf_counter() - started_at
-
-    clips_view = ctx.dataset.to_clips(field)
-    n_matched_clips = len(clips_view)
-    n_matched_samples = len(
-        ctx.dataset.match(F(field) != None).match(  # noqa: E711
-            F(f"{field}.detections").length() > 0
-        )
-    )
-
-    usage = model.usage_totals
-    run_key = _register_custom_run(
-        ctx,
-        version=version,
-        operation="event_search",
-        summary={
-            "mode": MODE_EVENT_SEARCH,
-            "query": query,
-            "field": field,
-            "n_total": total,
-            "n_matched_samples": n_matched_samples,
-            "n_matched_clips": n_matched_clips,
-            "n_temporal_detections": n_clips,
-            "elapsed_seconds": round(elapsed_s, 2),
-            "api_calls": usage["calls"],
-            "prompt_tokens": usage["prompt_tokens"],
-            "completion_tokens": usage["completion_tokens"],
-            "total_tokens": usage["total_tokens"],
-        },
-    )
-
-    summary_md = (
-        f"**Event Search** completed.  \n"
-        f"- Query: `{query}`  \n"
-        f"- Matched: **{n_matched_samples}** / {total} videos "
-        f"(**{n_matched_clips}** event clip(s))  \n"
-        f"- Output field: `{field}`  \n"
-        f"- Elapsed: **{_format_elapsed(elapsed_s)}** across **{usage['calls']}** API call(s)  \n"
-        f"- Tokens: **{usage['prompt_tokens']:,}** in / **{usage['completion_tokens']:,}** out  \n"
-        f"- View auto-switched to a clips view, one row per detected event."
-    )
-    notify(
-        ctx,
-        f"Event Search done: {n_matched_clips} clip(s) across {n_matched_samples}/{total} video(s).",
-        variant="success",
-    )
-
-    yield ctx.ops.set_view(view=clips_view)
-    yield ctx.ops.reload_samples()
-    yield _yield_progress(
-        ctx, mode_label="Event Search",
-        status=f"Complete -- {n_matched_clips} clip(s) across {n_matched_samples}/{total} video(s).",
-        done=total, total=total, model=model, started_at=started_at,
-    )
-
-    yield {
-        "mode": MODE_EVENT_SEARCH,
-        "summary": summary_md,
-        "run_key": run_key,
-        "elapsed_seconds": round(elapsed_s, 2),
-    }
 
 
 async def _execute_semantic_search(
@@ -950,23 +1014,12 @@ async def _execute_semantic_search(
 
     view = ctx.target_view()
     total = len(view)
-    notify(ctx, f"Scoring {total} sample(s) for '{query}'...")
-
-    yield _yield_progress(
-        ctx, mode_label="Semantic Search", status=f"Starting on {total} sample(s)...", done=0, total=total
-    )
-
     model = _build_model(
         ctx,
         task=Task.CLASSIFY_SINGLE,
         target=None,
         prompt=_SEMANTIC_SEARCH_TEMPLATE.format(query=query),
     )
-    for msg in _drain_log_buffer(ctx, logbuf):
-        yield msg
-    model.reset_usage_totals()
-
-    started_at = time.perf_counter()
     counters = {"yes": 0}
 
     def on_sample(sample: fo.Sample, label: Any, _i: int) -> str:
@@ -976,70 +1029,50 @@ async def _execute_semantic_search(
             counters["yes"] += 1
         return f"{counters['yes']} 'yes' so far"
 
-    async for msg in _predict_with_progress(
-        ctx, view, model=model, mode_label="Semantic Search", logbuf=logbuf,
-        started_at=started_at, on_sample=on_sample,
+    def finalize(elapsed_s: float) -> _RunOutcome:
+        n_yes = counters["yes"]
+        matched_view = ctx.dataset.match(
+            (F(f"{field}.label") == "yes") & (F(f"{field}.confidence") >= threshold)
+        )
+        n_matched = len(matched_view)
+        usage = model.usage_totals
+        summary_md = (
+            f"**Semantic Search** completed.  \n"
+            f"- Query: `{query}`  \n"
+            f"- Threshold: `{threshold:.2f}`  \n"
+            f"- 'yes' answers: **{n_yes}** / {total}  \n"
+            f"- Above threshold: **{n_matched}** samples  \n"
+            f"- Output field: `{field}`  \n"
+            f"- Elapsed: **{_format_elapsed(elapsed_s)}** across **{usage['calls']}** API call(s)  \n"
+            f"- Tokens: **{usage['prompt_tokens']:,}** in / **{usage['completion_tokens']:,}** out  \n"
+            f"- View auto-filtered to above-threshold samples."
+        )
+        return _RunOutcome(
+            summary={
+                "mode": MODE_SEMANTIC_SEARCH,
+                "query": query,
+                "field": field,
+                "threshold": threshold,
+                "n_total": total,
+                "n_yes": n_yes,
+                "n_matched_samples": n_matched,
+                **_usage_summary(model, elapsed_s),
+            },
+            summary_md=summary_md,
+            notify_message=f"Semantic Search done: {n_matched}/{total} matched at >= {threshold:.2f}.",
+            final_status=f"Complete -- {n_matched}/{total} matched at >= {threshold:.2f}",
+            view_ops=[ctx.ops.set_view(view=matched_view), ctx.ops.reload_samples()],
+        )
+
+    async for msg in _run_mode(
+        ctx, version, logbuf,
+        view=view, mode_value=MODE_SEMANTIC_SEARCH, mode_label="Semantic Search",
+        operation="semantic_search",
+        start_notify=f"Scoring {total} sample(s) for '{query}'...",
+        start_status=f"Starting on {total} sample(s)...",
+        model=model, on_sample=on_sample, finalize=finalize,
     ):
         yield msg
-
-    n_yes = counters["yes"]
-    elapsed_s = time.perf_counter() - started_at
-
-    matched_view = ctx.dataset.match(
-        (F(f"{field}.label") == "yes") & (F(f"{field}.confidence") >= threshold)
-    )
-    n_matched = len(matched_view)
-
-    usage = model.usage_totals
-    run_key = _register_custom_run(
-        ctx,
-        version=version,
-        operation="semantic_search",
-        summary={
-            "mode": MODE_SEMANTIC_SEARCH,
-            "query": query,
-            "field": field,
-            "threshold": threshold,
-            "n_total": total,
-            "n_yes": n_yes,
-            "n_matched_samples": n_matched,
-            "elapsed_seconds": round(elapsed_s, 2),
-            "api_calls": usage["calls"],
-            "prompt_tokens": usage["prompt_tokens"],
-            "completion_tokens": usage["completion_tokens"],
-            "total_tokens": usage["total_tokens"],
-        },
-    )
-
-    summary_md = (
-        f"**Semantic Search** completed.  \n"
-        f"- Query: `{query}`  \n"
-        f"- Threshold: `{threshold:.2f}`  \n"
-        f"- 'yes' answers: **{n_yes}** / {total}  \n"
-        f"- Above threshold: **{n_matched}** samples  \n"
-        f"- Output field: `{field}`  \n"
-        f"- Elapsed: **{_format_elapsed(elapsed_s)}** across **{usage['calls']}** API call(s)  \n"
-        f"- Tokens: **{usage['prompt_tokens']:,}** in / **{usage['completion_tokens']:,}** out  \n"
-        f"- View auto-filtered to above-threshold samples."
-    )
-    notify(
-        ctx, f"Semantic Search done: {n_matched}/{total} matched at >= {threshold:.2f}.", variant="success"
-    )
-
-    yield ctx.ops.set_view(view=matched_view)
-    yield ctx.ops.reload_samples()
-    yield _yield_progress(
-        ctx, mode_label="Semantic Search",
-        status=f"Complete -- {n_matched}/{total} matched at >= {threshold:.2f}",
-        done=total, total=total, model=model, started_at=started_at,
-    )
-
-    yield {
-        "mode": MODE_SEMANTIC_SEARCH,
-        "summary": summary_md,
-        "run_key": run_key,
-        "elapsed_seconds": round(elapsed_s, 2),
-    }
 
 
 async def _execute_bootstrap(
@@ -1056,22 +1089,10 @@ async def _execute_bootstrap(
         raise ValueError("Bootstrap Labels requires a non-empty output field name.")
 
     view = ctx.target_view()
-    per_frame = task_supports_per_frame(task)
-
     total = len(view)
-    notify(ctx, f"Running {task.value} on {total} sample(s)...")
-
+    per_frame = task_supports_per_frame(task)
     mode_label = f"Bootstrap {task.value}"
-    yield _yield_progress(
-        ctx, mode_label=mode_label, status=f"Starting on {total} sample(s)...", done=0, total=total
-    )
-
     model = _build_model(ctx, task=task, target=target)
-    for msg in _drain_log_buffer(ctx, logbuf):
-        yield msg
-    model.reset_usage_totals()
-
-    started_at = time.perf_counter()
     stats = {"frame_labels": 0, "sample_labels": 0, "frames_touched": 0, "dropped": 0}
 
     def on_sample(sample: fo.Sample, label: Any, _i: int) -> str:
@@ -1085,80 +1106,65 @@ async def _execute_bootstrap(
         drop_tail = f"; {stats['dropped']} dropped" if stats["dropped"] else ""
         return f"{n_labels} label(s) written{drop_tail}"
 
-    async for msg in _predict_with_progress(
-        ctx, view, model=model, mode_label=mode_label, logbuf=logbuf,
-        started_at=started_at, on_sample=on_sample,
+    def finalize(elapsed_s: float) -> _RunOutcome:
+        n_frame_labels = stats["frame_labels"]
+        n_sample_labels = stats["sample_labels"]
+        n_frames_touched = stats["frames_touched"]
+        n_dropped = stats["dropped"]
+        n_labels = n_frame_labels + n_sample_labels
+        usage = model.usage_totals
+
+        summary_md_lines = [
+            f"**Bootstrap Labels** ({task.value}) completed.  ",
+            f"- Target: `{target or '(none)'}`  ",
+            f"- Output field: `{field}`  ",
+            f"- Processed: {total} sample(s)  ",
+            f"- Frame-level labels: **{n_frame_labels}** across {n_frames_touched} frame(s)  ",
+            f"- Sample-level labels: **{n_sample_labels}**  ",
+            f"- Elapsed: **{_format_elapsed(elapsed_s)}** across **{usage['calls']}** API call(s)  ",
+            f"- Tokens: **{usage['prompt_tokens']:,}** in / **{usage['completion_tokens']:,}** out  ",
+        ]
+        if n_dropped:
+            summary_md_lines.append(f"- Dropped (no `t=` or missing `frame_rate`): **{n_dropped}**  ")
+
+        success_msg = f"Bootstrap {task.value} done: {n_labels} label(s) written to '{field}'"
+        if n_dropped:
+            success_msg += f" ({n_dropped} dropped -- see logs)"
+        final_drop_tail = f"; {n_dropped} dropped" if n_dropped else ""
+
+        return _RunOutcome(
+            summary={
+                "mode": MODE_BOOTSTRAP,
+                "task": task.value,
+                "prompt_source": ctx.params.get("bootstrap_prompt_source", "classes"),
+                "target": target,
+                "prompt_field": ctx.params.get("bootstrap_prompt_field") or None,
+                "prompt_prefix": (ctx.params.get("bootstrap_prompt_prefix") or "").strip() or None,
+                "field": field,
+                "n_total": total,
+                "n_labels": n_labels,
+                "n_frame_labels": n_frame_labels,
+                "n_sample_labels": n_sample_labels,
+                "n_frames_touched": n_frames_touched,
+                "n_dropped": n_dropped,
+                **_usage_summary(model, elapsed_s),
+            },
+            summary_md="\n".join(summary_md_lines),
+            notify_message=success_msg + ".",
+            notify_variant="success" if n_dropped == 0 else "warning",
+            final_status=f"Complete -- {n_labels} label(s) written{final_drop_tail}",
+            view_ops=[ctx.ops.reload_dataset()],
+        )
+
+    async for msg in _run_mode(
+        ctx, version, logbuf,
+        view=view, mode_value=MODE_BOOTSTRAP, mode_label=mode_label,
+        operation=f"bootstrap_{task.value}",
+        start_notify=f"Running {task.value} on {total} sample(s)...",
+        start_status=f"Starting on {total} sample(s)...",
+        model=model, on_sample=on_sample, finalize=finalize,
     ):
         yield msg
-
-    n_frame_labels = stats["frame_labels"]
-    n_sample_labels = stats["sample_labels"]
-    n_frames_touched = stats["frames_touched"]
-    n_dropped = stats["dropped"]
-    n_labels = n_frame_labels + n_sample_labels
-    elapsed_s = time.perf_counter() - started_at
-
-    usage = model.usage_totals
-    prompt_source = ctx.params.get("bootstrap_prompt_source", "classes")
-    run_key = _register_custom_run(
-        ctx,
-        version=version,
-        operation=f"bootstrap_{task.value}",
-        summary={
-            "mode": MODE_BOOTSTRAP,
-            "task": task.value,
-            "prompt_source": prompt_source,
-            "target": target,
-            "prompt_field": ctx.params.get("bootstrap_prompt_field") or None,
-            "prompt_prefix": (ctx.params.get("bootstrap_prompt_prefix") or "").strip() or None,
-            "field": field,
-            "n_total": total,
-            "n_labels": n_labels,
-            "n_frame_labels": n_frame_labels,
-            "n_sample_labels": n_sample_labels,
-            "n_frames_touched": n_frames_touched,
-            "n_dropped": n_dropped,
-            "elapsed_seconds": round(elapsed_s, 2),
-            "api_calls": usage["calls"],
-            "prompt_tokens": usage["prompt_tokens"],
-            "completion_tokens": usage["completion_tokens"],
-            "total_tokens": usage["total_tokens"],
-        },
-    )
-
-    summary_md_lines = [
-        f"**Bootstrap Labels** ({task.value}) completed.  ",
-        f"- Target: `{target or '(none)'}`  ",
-        f"- Output field: `{field}`  ",
-        f"- Processed: {total} sample(s)  ",
-        f"- Frame-level labels: **{n_frame_labels}** across {n_frames_touched} frame(s)  ",
-        f"- Sample-level labels: **{n_sample_labels}**  ",
-        f"- Elapsed: **{_format_elapsed(elapsed_s)}** across **{usage['calls']}** API call(s)  ",
-        f"- Tokens: **{usage['prompt_tokens']:,}** in / **{usage['completion_tokens']:,}** out  ",
-    ]
-    if n_dropped:
-        summary_md_lines.append(f"- Dropped (no `t=` or missing `frame_rate`): **{n_dropped}**  ")
-    summary_md = "\n".join(summary_md_lines)
-
-    success_msg = f"Bootstrap {task.value} done: {n_labels} label(s) written to '{field}'"
-    if n_dropped:
-        success_msg += f" ({n_dropped} dropped -- see logs)"
-    notify(ctx, success_msg + ".", variant="success" if n_dropped == 0 else "warning")
-
-    yield ctx.ops.reload_dataset()
-    final_drop_tail = f"; {n_dropped} dropped" if n_dropped else ""
-    yield _yield_progress(
-        ctx, mode_label=mode_label,
-        status=f"Complete -- {n_labels} label(s) written{final_drop_tail}",
-        done=total, total=total, model=model, started_at=started_at,
-    )
-
-    yield {
-        "mode": MODE_BOOTSTRAP,
-        "summary": summary_md,
-        "run_key": run_key,
-        "elapsed_seconds": round(elapsed_s, 2),
-    }
 
 
 # ---------------------------------------------------------------------------

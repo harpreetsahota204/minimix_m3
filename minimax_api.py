@@ -36,6 +36,8 @@ import numpy as np
 from openai import OpenAI, RateLimitError
 from PIL import Image
 
+from ._shared import preview_text
+
 logger = logging.getLogger("minimax_m3")
 
 
@@ -157,24 +159,25 @@ def sample_video_frames(
     return frames, fps, total
 
 
+def frame_parts(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the OpenAI content parts for a timestamped frame strip.
+
+    Each frame contributes a ``[Frame at t=...s]`` text marker (so the model can
+    reason about *when* something happens) followed by its ``image_url`` part.
+    """
+    parts: list[dict[str, Any]] = []
+    for f in frames:
+        parts.append({"type": "text", "text": f"[Frame at t={f['t']:.2f}s]"})
+        parts.append({"type": "image_url", "image_url": {"url": f["url"]}})
+    return parts
+
+
 def build_frame_strip_content(prompt: str, frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build a single user message's content from a prompt + timestamped frames.
 
-    Each frame is preceded by a ``[Frame at t=...s]`` text marker so the model
-    can reason about *when* something happens. Mirrors the notebook's
-    ``build_frame_content``.
+    Mirrors the notebook's ``build_frame_content``.
     """
-    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for f in frames:
-        content.append({"type": "text", "text": f"[Frame at t={f['t']:.2f}s]"})
-        content.append({"type": "image_url", "image_url": {"url": f["url"]}})
-    return content
-
-
-def _truncate(text: str, limit: int = 200) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "..."
+    return [{"type": "text", "text": prompt}, *frame_parts(frames)]
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +343,7 @@ class MiniMaxClient:
     def _log_response_summary(response: Any, attempt: int) -> None:
         choice = response.choices[0]
         usage = getattr(response, "usage", None)
-        content_preview = _truncate((choice.message.content or "").replace("\n", " "))
+        content_preview = preview_text(choice.message.content or "")
         if usage is not None:
             logger.info(
                 "[minimax_m3] response id=%s attempt=%d finish_reason=%s "
@@ -371,8 +374,8 @@ def _last_user_text_preview(messages: list[dict[str, Any]]) -> str:
         return ""
     content = user_msgs[-1].get("content", "")
     if isinstance(content, str):
-        return _truncate(content)
+        return preview_text(content)
     for part in content:
         if isinstance(part, dict) and part.get("type") == "text":
-            return _truncate(part.get("text", ""))
+            return preview_text(part.get("text", ""))
     return ""

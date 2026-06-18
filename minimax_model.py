@@ -29,6 +29,7 @@ from typing import Any
 import fiftyone as fo
 from fiftyone import Model
 
+from ._shared import preview_text
 from .minimax_api import (
     DEFAULT_MODEL_ID,
     MiniMaxClient,
@@ -203,7 +204,7 @@ class MiniMaxModel(Model):
             self._config.task.value,
             self._config.target,
             filepath,
-            _preview(prompt),
+            preview_text(prompt),
         )
         response = self._chat(content)
         text = response.choices[0].message.content or ""
@@ -226,7 +227,7 @@ class MiniMaxModel(Model):
             self._config.target,
             filepath,
             len(frames),
-            _preview(prompt),
+            preview_text(prompt),
         )
         response = self._chat(content)
         text = response.choices[0].message.content or ""
@@ -259,7 +260,7 @@ class MiniMaxModel(Model):
             self._config.target,
             filepath,
             len(frames),
-            _preview(prompt),
+            preview_text(prompt),
         )
 
         accumulated: list[Any] = []
@@ -337,10 +338,6 @@ def _image_content(prompt: str, image_url: str) -> list[dict[str, Any]]:
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": image_url}},
     ]
-
-
-def _preview(text: str, limit: int = 200) -> str:
-    return text[:limit] + ("..." if len(text) > limit else "")
 
 
 def _typename(label: Any) -> str:

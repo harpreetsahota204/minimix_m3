@@ -8,6 +8,14 @@ interface PanelUris {
   save_as_label:    string;
 }
 
+interface PanelEventResult<T> {
+  result?: T & { error?: string };
+}
+
+function panelResult<T>(value: unknown): PanelEventResult<T> {
+  return typeof value === "object" && value !== null ? value as PanelEventResult<T> : {};
+}
+
 /**
  * Bridge to the Python MiniMaxChatPanel methods.
  *
@@ -23,8 +31,8 @@ export function usePanelClient(uris: PanelUris) {
         handleEvent(methodName, {
           operator: uri,
           params,
-          callback: (result: any) => {
-            const r = result?.result as (T & { error?: string }) | undefined;
+          callback: (result: unknown) => {
+            const r = panelResult<T>(result).result;
             if (r?.error) reject(new Error(r.error));
             else resolve(r as T);
           },

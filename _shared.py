@@ -57,6 +57,14 @@ def notify(ctx: Any, message: str, *, variant: str = "info") -> None:
     ctx.ops.notify(f"[minimax-m3] {message}", variant=variant)
 
 
+def preview_text(text: str, *, limit: int = 200) -> str:
+    """Return a single-line preview of ``text`` capped at ``limit`` chars."""
+    one_line = text.replace("\n", " ")
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[:limit] + "..."
+
+
 def get_api_key(ctx: Any) -> str | None:
     """Return the Hugging Face token from FiftyOne secrets, or `None`.
 

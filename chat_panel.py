@@ -40,6 +40,7 @@ from typing import Any
 import bson
 from openai import OpenAI
 
+import fiftyone as fo
 import fiftyone.operators as foo
 import fiftyone.operators.types as types
 from fiftyone import ViewField as F
@@ -50,12 +51,12 @@ from .minimax_api import (
     DEFAULT_MODEL_ID,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TOP_K,
-    build_frame_strip_content,
     encode_image,
     encode_image_with_size,
+    frame_parts,
     sample_video_frames,
 )
-from .minimax_parser import to_fiftyone
+from .minimax_parser import count_label_items, to_fiftyone
 from .prompts import JSON_SHAPE_BY_FORMAT
 
 logger = logging.getLogger("minimax_m3")
@@ -136,14 +137,28 @@ def _detect_format(content: str) -> str | None:
     return None
 
 
-def _count_label_items(label: Any) -> int:
-    if hasattr(label, "detections"):
-        return len(label.detections)
-    if hasattr(label, "keypoints"):
-        return len(label.keypoints)
-    if hasattr(label, "classifications"):
-        return len(label.classifications)
-    return 1
+def _append_label(existing: Any, incoming: Any, field: str) -> Any:
+    """Append compatible converted labels to an existing sample field value."""
+    if existing is None:
+        return incoming
+
+    if isinstance(existing, fo.Detections) and isinstance(incoming, fo.Detections):
+        return fo.Detections(detections=[*existing.detections, *incoming.detections])
+
+    if isinstance(existing, fo.Keypoints) and isinstance(incoming, fo.Keypoints):
+        return fo.Keypoints(keypoints=[*existing.keypoints, *incoming.keypoints])
+
+    if isinstance(existing, fo.TemporalDetections) and isinstance(
+        incoming, fo.TemporalDetections
+    ):
+        return fo.TemporalDetections(
+            detections=[*existing.detections, *incoming.detections]
+        )
+
+    raise ValueError(
+        f"field {field!r} already contains {type(existing).__name__}; "
+        f"cannot append {type(incoming).__name__}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +174,7 @@ def _build_media_parts(filepath: str, media_type: str, n_frames: int) -> list[di
     """
     if media_type == "video":
         frames, _fps, _total = sample_video_frames(filepath, n=n_frames)
-        # build_frame_strip_content prepends a text prompt; drop that here and
-        # keep only the frame parts so the caller can place the question last.
-        parts = build_frame_strip_content("", frames)
-        return parts[1:]  # skip the empty leading text part
+        return frame_parts(frames)
     return [{"type": "image_url", "image_url": {"url": encode_image(filepath)}}]
 
 
@@ -335,7 +347,7 @@ class MiniMaxChatPanel(foo.Panel):
 
         # Steer M3's output shape by appending a format instruction to the new
         # question. Prefer the user-edited `hint_text`; fall back to the default
-        # suffix for the selected format; "auto" appends nothing.
+        # instruction for the selected format; "auto" appends nothing.
         question_to_send = question
         if hint_text:
             question_to_send = f"{question}\n\n{hint_text}"
@@ -344,32 +356,22 @@ class MiniMaxChatPanel(foo.Panel):
 
         media_parts = _build_media_parts(filepath, media_type, n_frames)
 
-        # Build the messages array. The media is embedded in the first user
-        # message only; subsequent turns are text.
+        # Full turn sequence is the prior history plus the new question. The
+        # media is embedded once, in the first user message; every other turn is
+        # plain text. The new question is itself a user turn, so the media always
+        # lands somewhere even when history has no user turn.
+        turns = [*history, {"role": "user", "content": question_to_send}]
         messages: list[dict[str, Any]] = []
-        if not history:
-            messages.append({
-                "role": "user",
-                "content": [*media_parts, {"type": "text", "text": question_to_send}],
-            })
-        else:
-            first_user_injected = False
-            for turn in history:
-                if turn["role"] == "user" and not first_user_injected:
-                    messages.append({
-                        "role": "user",
-                        "content": [*media_parts, {"type": "text", "text": turn["content"]}],
-                    })
-                    first_user_injected = True
-                else:
-                    messages.append({"role": turn["role"], "content": turn["content"]})
-            if not first_user_injected:
+        media_injected = False
+        for turn in turns:
+            if turn["role"] == "user" and not media_injected:
                 messages.append({
                     "role": "user",
-                    "content": [*media_parts, {"type": "text", "text": question_to_send}],
+                    "content": [*media_parts, {"type": "text", "text": turn["content"]}],
                 })
+                media_injected = True
             else:
-                messages.append({"role": "user", "content": question_to_send})
+                messages.append({"role": turn["role"], "content": turn["content"]})
 
         thinking = "adaptive" if enable_thinking else "disabled"
 
@@ -451,20 +453,14 @@ class MiniMaxChatPanel(foo.Panel):
                 image_size = encode_image_with_size(sample.filepath)[1]
 
             label = to_fiftyone(content, fmt, frame_rate=fr, image_size=image_size)
+            existing_label = None if field_is_new else sample.get_field(field)
+            label = _append_label(existing_label, label, field)
 
             sample[field] = label
             sample.save()
 
-            # A brand-new field needs a full dataset reload so the App picks up
-            # the schema change; reload_samples() alone leaves it invisible
-            # until a manual refresh.
-            if field_is_new:
-                ctx.ops.reload_dataset()
-            else:
-                ctx.ops.reload_samples()
-
             label_type = type(label).__name__
-            count = _count_label_items(label)
+            count = count_label_items(label)
             return {"saved": True, "label_type": label_type, "count": count, "field": field}
 
         except Exception as exc:

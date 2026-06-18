@@ -15,6 +15,10 @@ function logError(...args: unknown[]) {
   console.error("[minimax_chat]", ...args);
 }
 
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
 // ---------------------------------------------------------------------------
 // Session persistence — per-sample in sessionStorage
 // ---------------------------------------------------------------------------
@@ -180,7 +184,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   const runIdRef      = useRef("");
   const cursorRef     = useRef(0);
   const chunkCountRef = useRef(0);
-  const prevSampleId  = useRef("");
+  const prevSampleKey = useRef("");
   const scrollRef     = useRef<HTMLDivElement>(null);
 
   useEffect(() => { ensureStyles(); }, []);
@@ -192,8 +196,9 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     const newMt   = data?.media_type ?? "image";
     const newFr   = data?.frame_rate ?? null;
     if (!newId || !newPath) return;
-    if (newId === prevSampleId.current) return;
-    prevSampleId.current = newId;
+    const sampleKey = JSON.stringify([newId, newPath, newMt, newFr]);
+    if (sampleKey === prevSampleKey.current) return;
+    prevSampleKey.current = sampleKey;
 
     log("sample synced", { sample_id: newId, filepath: newPath, media_type: newMt, frame_rate: newFr });
 
@@ -226,7 +231,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     } else {
       setTurns([]);
     }
-  }, [data?.filepath, data?.sample_id]); // eslint-disable-line
+  }, [data?.filepath, data?.sample_id, data?.media_type, data?.frame_rate]);
 
   // ── Persist turns ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -294,7 +299,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
         .catch((err) => logError("getStreamChunk error", err));
     }, 250);
     return () => clearInterval(id);
-  }, [streamState]); // eslint-disable-line
+  }, [getStreamChunk, streamState]);
 
   // ── Auto-scroll ───────────────────────────────────────────────────────────
   useEffect(() => {
@@ -338,9 +343,10 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
       });
       log("ask ← run_id:", result.run_id);
       runIdRef.current = result.run_id;
-    } catch (e: any) {
-      logError("ask failed", e?.message);
-      setStreamError(e?.message ?? "Request failed.");
+    } catch (e: unknown) {
+      const message = errorMessage(e, "Request failed.");
+      logError("ask failed", message);
+      setStreamError(message);
       setStreamState("error");
     }
   }, [question, streamState, filepath, mediaType, turns, enableThinking, hintFormat, currentHintText, nFrames, ask]);
@@ -392,11 +398,15 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
           error:          null,
         },
       }));
-    } catch (e: any) {
-      logError("convert failed", e?.message);
+      // The open sample modal does not pick up plugin-written labels until
+      // the route reloads; the URL preserves ?id=<sample_id>.
+      window.setTimeout(() => window.location.reload(), 350);
+    } catch (e: unknown) {
+      const message = errorMessage(e, "Save failed.");
+      logError("convert failed", message);
       setTurnSaveStates((prev) => ({
         ...prev,
-        [turnIdx]: { ...prev[turnIdx], saving: false, saved: false, error: e?.message ?? "Save failed." },
+        [turnIdx]: { ...prev[turnIdx], saving: false, saved: false, error: message },
       }));
     }
   }, [turnSaveStates, sampleId, frameRate, saveAsLabel]);

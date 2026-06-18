@@ -27,8 +27,8 @@ Task -> media type -> output shape:
         CLASSIFY_MULTI   -> fo.Classifications (JSON).
         VQA              -> free text (user-supplied question).
 
-Coordinates: M3 emits NORMALIZED [0, 1] coordinates, so `minimax_parser` uses
-a `COORD_SCALE` of 1.0.
+Coordinates: M3 emits NORMALIZED [0, 1] coordinates, consumed by FiftyOne
+directly (no rescaling).
 """
 
 from __future__ import annotations
@@ -139,7 +139,7 @@ TASKS_TEMPORAL: Final[frozenset[Task]] = frozenset(
 # JSON-shape suffixes appended to grounding prompts. Kept VERBATIM (modulo the
 # task instruction prefix) with the proven prompts in ``explore_minimax_m3.py``
 # so the model formats output exactly as the vibe-check reference expects. M3
-# returns NORMALIZED [0, 1] coordinates, consumed directly (COORD_SCALE = 1.0).
+# returns NORMALIZED [0, 1] coordinates, consumed directly.
 _BOX_JSON_SHAPE: Final[str] = (
     "Return ONLY JSON: a list like\n"
     '[{"label": "dog", "box": [x1, y1, x2, y2]}]\n'

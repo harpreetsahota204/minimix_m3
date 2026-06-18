@@ -7,9 +7,9 @@ annotation_format, ...)` is the single dispatcher. JSON extraction strips
 preamble/trailing prose and stray brackets).
 
 Conventions:
-    * Coordinates are expected NORMALIZED [0, 1] (``COORD_SCALE = 1.0``) and
-      consumed by FiftyOne directly. When M3 instead emits absolute pixels, the
-      box/point parsers normalize them via a passed-in encoded ``image_size``.
+    * Coordinates are expected NORMALIZED [0, 1] and consumed by FiftyOne
+      directly. When M3 instead emits absolute pixels, the box/point parsers
+      normalize them via a passed-in encoded ``image_size``.
     * Boxes: ``[x1, y1, x2, y2]`` (top-left / bottom-right) ->
       ``fo.Detection(bounding_box=[x1, y1, x2 - x1, y2 - y1])``.
     * Keypoints: ``[x, y]`` -> ``fo.Keypoint(points=[[x, y]])``.
@@ -27,11 +27,9 @@ from typing import Any, TypeAlias
 
 import fiftyone as fo
 
+from ._shared import preview_text
+
 logger = logging.getLogger("minimax_m3")
-
-
-# M3 returns NORMALIZED [0, 1] coordinates, so no rescaling is needed.
-COORD_SCALE: float = 1.0
 
 
 # Return shape of `to_fiftyone`.
@@ -143,7 +141,7 @@ def _coerce_box(raw: Any) -> tuple[float, float, float, float] | None:
     if not isinstance(raw, (list, tuple)) or len(raw) < 4:
         return None
     try:
-        x1, y1, x2, y2 = (float(v) / COORD_SCALE for v in raw[:4])
+        x1, y1, x2, y2 = (float(v) for v in raw[:4])
     except (TypeError, ValueError):
         return None
     if x2 < x1:
@@ -171,7 +169,7 @@ def _coerce_xy(raw: Any) -> tuple[float, float] | None:
     if not isinstance(raw, (list, tuple)) or len(raw) < 2:
         return None
     try:
-        return float(raw[0]) / COORD_SCALE, float(raw[1]) / COORD_SCALE
+        return float(raw[0]), float(raw[1])
     except (TypeError, ValueError):
         return None
 
@@ -332,14 +330,11 @@ def to_fiftyone(
             pixel coordinates instead of normalized ``[0, 1]`` values. Ignored
             for non-spatial formats.
     """
-    preview = content.replace("\n", " ")
-    if len(preview) > 200:
-        preview = preview[:200] + "..."
     logger.info(
         "[minimax_m3] to_fiftyone: format=%s len=%d preview=%r",
         annotation_format,
         len(content),
-        preview,
+        preview_text(content),
     )
 
     if not content:
@@ -635,7 +630,7 @@ def write_per_frame_labels(
     if not isinstance(label_obj, (fo.Detections, fo.Keypoints)):
         sample[field] = label_obj
         sample.save()
-        n_items = _count_sample_level_items(label_obj)
+        n_items = count_label_items(label_obj)
         logger.info(
             "[minimax_m3] wrote sample-level %s (%d item(s)) -> sample[%s]",
             type(label_obj).__name__,
@@ -718,12 +713,17 @@ def _writeback_summary(
     }
 
 
-def _count_sample_level_items(label_obj: Any) -> int:
-    match label_obj:
+def count_label_items(label: Any) -> int:
+    """Return the number of items in a FiftyOne label container (1 for scalars)."""
+    match label:
+        case fo.Detections():
+            return len(label.detections)
+        case fo.Keypoints():
+            return len(label.keypoints)
         case fo.Classifications():
-            return len(label_obj.classifications)
+            return len(label.classifications)
         case fo.TemporalDetections():
-            return len(label_obj.detections)
+            return len(label.detections)
         case _:
             return 1
 
