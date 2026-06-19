@@ -9,6 +9,16 @@ import type { PanelData, PanelSchema, SaveLabelResult, Turn } from "./types";
 // Operator that writes a converted label and refreshes the open modal.
 const SAVE_LABEL_URI = "@harpreetsahota/minimax-m3/save_minimax_label";
 
+// Image encode resolution (longest side, px) sent to M3. Higher = more detail
+// for small objects at the cost of a larger payload; 0 = native (no downscale).
+// Mirrors minimax_api.DEFAULT_IMAGE_MAX_SIDE.
+const DEFAULT_IMAGE_MAX_SIDE = 1280;
+const IMAGE_RESOLUTIONS: { label: string; value: number }[] = [
+  { label: "Standard", value: 1280 },
+  { label: "High",     value: 2048 },
+  { label: "Native",   value: 0 },
+];
+
 // ---------------------------------------------------------------------------
 // Logging — prefixed for easy filtering in DevTools ([minimax_chat])
 // ---------------------------------------------------------------------------
@@ -35,6 +45,8 @@ interface StoredSession {
   enableThinking: boolean;
   hintFormat: string;
   nFrames: number;
+  /** Image encode resolution (longest side, px); 0 = native. */
+  imageMaxSide?: number;
   /** Per-format edits to the format instruction; empty unless customized. */
   hintTexts?: Record<string, string>;
 }
@@ -163,6 +175,8 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   // "auto" = let the model decide; other values append a JSON-shape suffix.
   const [hintFormat, setHintFormat] = useState("auto");
   const [nFrames, setNFrames] = useState(8);
+  // Image encode resolution (longest side, px); 0 = native (no downscale).
+  const [imageMaxSide, setImageMaxSide] = useState(DEFAULT_IMAGE_MAX_SIDE);
   // Per-format edits to the format instruction; absence = use the default.
   const [hintTexts, setHintTexts] = useState<Record<string, string>>({});
   const [hintEditing, setHintEditing] = useState(false);
@@ -234,6 +248,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
       setEnableThinking(cached.enableThinking);
       setHintFormat(cached.hintFormat ?? "auto");
       setNFrames(cached.nFrames ?? 8);
+      setImageMaxSide(cached.imageMaxSide ?? DEFAULT_IMAGE_MAX_SIDE);
       setHintTexts(cached.hintTexts ?? {});
     } else {
       setTurns([]);
@@ -243,8 +258,8 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   // ── Persist turns ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!sampleId) return;
-    saveSession(sampleId, { turns, enableThinking, hintFormat, nFrames, hintTexts });
-  }, [turns, enableThinking, hintFormat, nFrames, hintTexts, sampleId]);
+    saveSession(sampleId, { turns, enableThinking, hintFormat, nFrames, imageMaxSide, hintTexts });
+  }, [turns, enableThinking, hintFormat, nFrames, imageMaxSide, hintTexts, sampleId]);
 
   // ── Stream polling ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -335,7 +350,8 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     // currentHintText is already "" when hintFormat is "auto".
     log("ask →", { filepath, media_type: mediaType, history_len: historyForApi.length,
                     enable_thinking: enableThinking, hint_format: hintFormat,
-                    hint_text_len: currentHintText.length, n_frames: nFrames });
+                    hint_text_len: currentHintText.length, n_frames: nFrames,
+                    image_max_side: imageMaxSide });
 
     try {
       const result = await ask({
@@ -347,6 +363,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
         hint_format:     hintFormat,
         hint_text:       currentHintText,
         n_frames:        nFrames,
+        image_max_side:  imageMaxSide,
       });
       log("ask ← run_id:", result.run_id);
       runIdRef.current = result.run_id;
@@ -356,7 +373,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
       setStreamError(message);
       setStreamState("error");
     }
-  }, [question, streamState, filepath, mediaType, turns, enableThinking, hintFormat, currentHintText, nFrames, ask]);
+  }, [question, streamState, filepath, mediaType, turns, enableThinking, hintFormat, currentHintText, nFrames, imageMaxSide, ask]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -660,6 +677,32 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
                   padding: "2px 5px", fontSize: 11, fontFamily: V.font, outline: "none",
                 }}
               />
+            </div>
+          )}
+
+          {/* Image resolution (image only) — higher = more detail for small objects */}
+          {mediaType === "image" && (
+            <div
+              title="Resolution sent to M3 (longest side). Higher helps small objects; Native sends full resolution."
+              style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: V.muted }}
+            >
+              <span style={{ flexShrink: 0 }}>Detail:</span>
+              <select
+                value={imageMaxSide}
+                onChange={(e) => setImageMaxSide(Number(e.target.value))}
+                style={{
+                  background: V.bg2, color: V.text,
+                  border: `1px solid ${V.divider}`, borderRadius: 4,
+                  padding: "2px 5px", fontSize: 11, fontFamily: V.font,
+                  cursor: "pointer", outline: "none",
+                }}
+              >
+                {IMAGE_RESOLUTIONS.map((r) => (
+                  <option key={r.value} value={r.value}>
+                    {r.label}{r.value > 0 ? ` (${r.value}px)` : ""}
+                  </option>
+                ))}
+              </select>
             </div>
           )}
         </div>

@@ -31,13 +31,15 @@ from fiftyone import Model
 
 from ._shared import preview_text
 from .minimax_api import (
+    DEFAULT_IMAGE_MAX_SIDE,
     DEFAULT_MODEL_ID,
     MiniMaxClient,
     build_frame_strip_content,
-    encode_image_with_size,
+    encode_image,
+    resolution_label,
     sample_video_frames,
 )
-from .minimax_parser import FOLabel, to_fiftyone
+from .minimax_parser import FOLabel, attach_provenance, to_fiftyone
 from .prompts import (
     TASK_DEFAULT_THINKING,
     TASK_TO_PARSER_FORMAT,
@@ -197,8 +199,7 @@ class MiniMaxModel(Model):
 
     def _predict_image(self, filepath: str, sample: fo.Sample | None = None) -> FOLabel:
         prompt = self._resolve_prompt(sample)
-        image_url, image_size = encode_image_with_size(filepath)
-        content = _image_content(prompt, image_url)
+        content = _image_content(prompt, encode_image(filepath))
         logger.info(
             "[minimax_m3] predict (image-mode): task=%s target=%r path=%s prompt=%r",
             self._config.task.value,
@@ -208,9 +209,8 @@ class MiniMaxModel(Model):
         )
         response = self._chat(content)
         text = response.choices[0].message.content or ""
-        label = to_fiftyone(
-            text, self.parser_format, target=self._config.target, image_size=image_size
-        )
+        label = to_fiftyone(text, self.parser_format, target=self._config.target)
+        attach_provenance(label, self._provenance(prompt, text, image=True))
         logger.info("[minimax_m3] predict produced %s", _typename(label))
         return label
 
@@ -237,6 +237,7 @@ class MiniMaxModel(Model):
             target=self._config.target,
             frame_rate=self._extract_frame_rate(sample) or fps,
         )
+        attach_provenance(label, self._provenance(prompt, text, image=False))
         logger.info("[minimax_m3] predict produced %s", _typename(label))
         return label
 
@@ -267,13 +268,10 @@ class MiniMaxModel(Model):
         for f in frames:
             response = self._chat(_image_content(prompt, f["url"]))
             text = response.choices[0].message.content or ""
-            label = to_fiftyone(
-                text,
-                parser_format,
-                target=self._config.target,
-                image_size=(f["w"], f["h"]),
-            )
+            label = to_fiftyone(text, parser_format, target=self._config.target)
             if isinstance(label, fo.Detections):
+                # Stamp with this frame's own raw output (one API call per frame).
+                attach_provenance(label, self._provenance(prompt, text, image=False))
                 for det in label.detections:
                     det["t"] = f["t"]
                     accumulated.append(det)
@@ -288,6 +286,18 @@ class MiniMaxModel(Model):
         return container
 
     # -- Internal helpers --------------------------------------------------------
+
+    @staticmethod
+    def _provenance(prompt: str, raw_output: str, *, image: bool) -> dict[str, str]:
+        """Provenance attributes stamped on each produced label.
+
+        ``minimax_resolution`` is only meaningful for images (video is
+        frame-sampled, so the image-detail setting doesn't apply).
+        """
+        attrs = {"minimax_prompt": prompt, "minimax_raw_output": raw_output}
+        if image:
+            attrs["minimax_resolution"] = resolution_label(DEFAULT_IMAGE_MAX_SIDE)
+        return attrs
 
     def _chat(self, content: list[dict[str, Any]]) -> Any:
         return self._client.chat_completion(

@@ -50,6 +50,7 @@ export function usePanelClient(uris: PanelUris) {
       hint_format: string;
       hint_text: string;
       n_frames: number;
+      image_max_side: number;
     }) => call<AskResult>("ask", uris.ask, params),
     [call, uris.ask]
   );

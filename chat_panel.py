@@ -49,15 +49,16 @@ from fiftyone import ViewField as F
 from ._shared import get_api_key, has_api_key
 from .minimax_api import (
     DEFAULT_BASE_URL,
+    DEFAULT_IMAGE_MAX_SIDE,
     DEFAULT_MODEL_ID,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TOP_K,
     encode_image,
-    encode_image_with_size,
     frame_parts,
+    resolution_label,
     sample_video_frames,
 )
-from .minimax_parser import count_label_items, to_fiftyone
+from .minimax_parser import attach_provenance, count_label_items, to_fiftyone
 from .prompts import JSON_SHAPE_BY_FORMAT
 
 logger = logging.getLogger("minimax_m3")
@@ -113,8 +114,12 @@ def _append_stream(run_id: str, text: str) -> None:
         f.flush()
 
 
+def _meta_path(run_id: str) -> Path:
+    return _STATUS_DIR / f".meta_{run_id}.json"
+
+
 def _clear_run(run_id: str) -> None:
-    for p in (_stream_path(run_id), _status_path(run_id)):
+    for p in (_stream_path(run_id), _status_path(run_id), _meta_path(run_id)):
         p.unlink(missing_ok=True)
 
 
@@ -188,6 +193,10 @@ def save_stream_as_label(
 ) -> dict:
     """Parse a completed stream as JSON and write it to a sample as a label.
 
+    Each saved label object is stamped with ``minimax_prompt``,
+    ``minimax_raw_output``, and (for images) ``minimax_resolution`` provenance
+    attributes read from the run's meta file.
+
     On success returns a summary dict including ``field_is_new`` and
     ``label_json`` -- the saved field serialized to the App's sample-JSON shape
     so the caller can refresh the open modal in place. Returns ``{"error": ...}``
@@ -216,13 +225,17 @@ def save_stream_as_label(
         field_is_new = field not in dataset.get_field_schema()
         sample = dataset[sample_id]
 
-        # For spatial formats on image samples, pass the encoded image size so
-        # the parser can normalize any pixel-space coordinates M3 emits.
-        image_size = None
-        if fmt in ("box", "point") and getattr(sample, "media_type", "image") != "video":
-            image_size = encode_image_with_size(sample.filepath)[1]
+        label = to_fiftyone(content, fmt, frame_rate=fr)
 
-        label = to_fiftyone(content, fmt, frame_rate=fr, image_size=image_size)
+        meta = _read_json(_meta_path(run_id)) or {}
+        provenance: dict[str, Any] = {
+            "minimax_prompt": meta.get("prompt", ""),
+            "minimax_raw_output": content,
+        }
+        if getattr(sample, "media_type", "image") != "video" and "image_max_side" in meta:
+            provenance["minimax_resolution"] = resolution_label(int(meta["image_max_side"]))
+        attach_provenance(label, provenance)
+
         existing_label = None if field_is_new else sample.get_field(field)
         label = _append_label(existing_label, label, field)
 
@@ -246,16 +259,21 @@ def save_stream_as_label(
 # ---------------------------------------------------------------------------
 
 
-def _build_media_parts(filepath: str, media_type: str, n_frames: int) -> list[dict[str, Any]]:
+def _build_media_parts(
+    filepath: str, media_type: str, n_frames: int, image_max_side: int
+) -> list[dict[str, Any]]:
     """Return the OpenAI content parts representing the media.
 
-    For images, a single ``image_url`` part. For videos, a timestamped frame
-    strip (text marker + ``image_url`` per sampled frame).
+    For images, a single ``image_url`` part encoded at ``image_max_side``
+    (longest side; ``<= 0`` sends native resolution). For videos, a timestamped
+    frame strip (text marker + ``image_url`` per sampled frame).
     """
     if media_type == "video":
         frames, _fps, _total = sample_video_frames(filepath, n=n_frames)
         return frame_parts(frames)
-    return [{"type": "image_url", "image_url": {"url": encode_image(filepath)}}]
+    return [
+        {"type": "image_url", "image_url": {"url": encode_image(filepath, max_side=image_max_side)}}
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +425,8 @@ class MiniMaxChatPanel(foo.Panel):
         Parameters (via ctx.params): filepath, media_type, question, history,
         enable_thinking (bool -> adaptive/disabled), hint_format
         ("auto"|"box"|"point"|"temporal"), hint_text (the editable format
-        instruction; overrides the default suffix), n_frames.
+        instruction; overrides the default suffix), n_frames, image_max_side
+        (image encode resolution; ``<= 0`` = native).
         """
         if not has_api_key(ctx):
             return {"error": "HF_TOKEN is not set."}
@@ -420,6 +439,7 @@ class MiniMaxChatPanel(foo.Panel):
         hint_format = ctx.params.get("hint_format", "auto")
         hint_text = (ctx.params.get("hint_text") or "").strip()
         n_frames = int(ctx.params.get("n_frames") or 8)
+        image_max_side = int(ctx.params.get("image_max_side", DEFAULT_IMAGE_MAX_SIDE))
 
         if not question:
             return {"error": "Question cannot be empty."}
@@ -435,7 +455,7 @@ class MiniMaxChatPanel(foo.Panel):
         elif hint_format and hint_format != "auto" and hint_format in _HINT_TEMPLATES:
             question_to_send = f"{question} {_HINT_TEMPLATES[hint_format]}"
 
-        media_parts = _build_media_parts(filepath, media_type, n_frames)
+        media_parts = _build_media_parts(filepath, media_type, n_frames, image_max_side)
 
         # Full turn sequence is the prior history plus the new question. The
         # media is embedded once, in the first user message; every other turn is
@@ -458,6 +478,12 @@ class MiniMaxChatPanel(foo.Panel):
 
         run_id = f"{ctx.current_sample or 'x'}_{int(time.time() * 1000)}"
         _clear_run(run_id)
+        # Persist provenance so the (separate) convert call can stamp the saved
+        # label with the prompt and image resolution this run actually used.
+        _write_json(
+            _meta_path(run_id),
+            {"prompt": question_to_send, "image_max_side": image_max_side},
+        )
 
         thread = threading.Thread(
             target=_run_stream_thread,

@@ -7,9 +7,8 @@ annotation_format, ...)` is the single dispatcher. JSON extraction strips
 preamble/trailing prose and stray brackets).
 
 Conventions:
-    * Coordinates are expected NORMALIZED [0, 1] and consumed by FiftyOne
-      directly. When M3 instead emits absolute pixels, the box/point parsers
-      normalize them via a passed-in encoded ``image_size``.
+    * Coordinates are NORMALIZED [0, 1] and consumed by FiftyOne directly (M3
+      reliably emits this scale, so no rescaling is applied).
     * Boxes: ``[x1, y1, x2, y2]`` (top-left / bottom-right) ->
       ``fo.Detection(bounding_box=[x1, y1, x2 - x1, y2 - y1])``.
     * Keypoints: ``[x, y]`` -> ``fo.Keypoint(points=[[x, y]])``.
@@ -187,70 +186,6 @@ def _all_numbers(seq: Any) -> bool:
     return all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in seq)
 
 
-# Coordinates above this are treated as absolute pixels rather than normalized
-# [0, 1] fractions. M3 is *prompted* for normalized coords but occasionally
-# emits pixels (e.g. ``[354, 421, 388, 488]``); anything > 1.5 can't be a valid
-# normalized coordinate, so it must be pixel-space.
-_PIXEL_THRESHOLD: float = 1.5
-
-
-def _clamp01(value: float) -> float:
-    """Clamp ``value`` into the ``[0, 1]`` range FiftyOne expects."""
-    return 0.0 if value < 0.0 else 1.0 if value > 1.0 else value
-
-
-def _pixel_divisors(
-    values: tuple[float, ...], image_size: tuple[int, int] | None, kind: str
-) -> tuple[int, int] | None:
-    """Return the ``(w, h)`` to divide ``values`` by, or ``None`` to leave as-is.
-
-    Returns the divisors only when ``values`` look like pixel coordinates (some
-    coord exceeds ``_PIXEL_THRESHOLD``) AND a usable ``image_size`` is known.
-    When the coords look like pixels but no size is available, warns and returns
-    ``None`` so the caller keeps the raw values.
-    """
-    if not any(v > _PIXEL_THRESHOLD for v in values):
-        return None
-    if image_size is None:
-        logger.warning(
-            "[minimax_m3] %s %s looks like pixel coords but no image size is "
-            "available to normalize it; leaving as-is (it may render off-image)",
-            kind,
-            values,
-        )
-        return None
-    w, h = image_size
-    return (w, h) if w > 0 and h > 0 else None
-
-
-def _to_unit_box(
-    coords: tuple[float, float, float, float],
-    image_size: tuple[int, int] | None,
-) -> tuple[float, float, float, float]:
-    """Normalize a pixel-space box to ``[0, 1]`` (dividing by the encoded size).
-
-    A box already in ``[0, 1]`` is returned unchanged; see ``_pixel_divisors``.
-    """
-    div = _pixel_divisors(coords, image_size, "box")
-    if div is None:
-        return coords
-    w, h = div
-    x1, y1, x2, y2 = coords
-    return (_clamp01(x1 / w), _clamp01(y1 / h), _clamp01(x2 / w), _clamp01(y2 / h))
-
-
-def _to_unit_xy(
-    xy: tuple[float, float],
-    image_size: tuple[int, int] | None,
-) -> tuple[float, float]:
-    """Normalize a pixel-space point to ``[0, 1]`` (dividing by the encoded size)."""
-    div = _pixel_divisors(xy, image_size, "point")
-    if div is None:
-        return xy
-    w, h = div
-    return (_clamp01(xy[0] / w), _clamp01(xy[1] / h))
-
-
 # Keys that mark a dict as a single grounding item (vs. a wrapper object).
 _ITEM_MARKER_KEYS: tuple[str, ...] = (
     "box", "bbox", "bbox_2d", "bounding_box",
@@ -307,7 +242,6 @@ def to_fiftyone(
     *,
     target: str | None = None,
     frame_rate: float | None = None,
-    image_size: tuple[int, int] | None = None,
 ) -> FOLabel:
     """Convert M3's raw response text to a FiftyOne label container.
 
@@ -325,10 +259,9 @@ def to_fiftyone(
         target: Class-label fallback for unlabeled items.
         frame_rate: Video frame rate, used for ``support`` mapping on temporal
             tasks; optional otherwise.
-        image_size: ``(width, height)`` of the *encoded* image the model saw,
-            used to normalize box/point outputs when the model returns absolute
-            pixel coordinates instead of normalized ``[0, 1]`` values. Ignored
-            for non-spatial formats.
+
+    Coordinates are consumed as the normalized ``[0, 1]`` values M3 emits; no
+    rescaling is applied.
     """
     logger.info(
         "[minimax_m3] to_fiftyone: format=%s len=%d preview=%r",
@@ -343,9 +276,9 @@ def to_fiftyone(
 
     match annotation_format:
         case "box":
-            return _parse_boxes(content, target=target, image_size=image_size)
+            return _parse_boxes(content, target=target)
         case "point":
-            return _parse_points(content, target=target, image_size=image_size)
+            return _parse_points(content, target=target)
         case "temporal":
             return _parse_temporal(content, frame_rate=frame_rate)
         case "caption" | "vqa":
@@ -377,15 +310,13 @@ def _empty_container_for(annotation_format: str) -> FOLabel:
             raise ValueError(f"unsupported annotation_format: {annotation_format!r}")
 
 
-def _parse_boxes(
-    content: str, *, target: str | None, image_size: tuple[int, int] | None = None
-) -> fo.Detections:
+def _parse_boxes(content: str, *, target: str | None) -> fo.Detections:
     """Parse boxes into Detections.
 
     Tolerates: wrapper dicts (``{"detections": [...]}``), single-item dicts,
     items missing a ``label`` key (falls back to ``target`` / ``"object"``),
-    alternate label keys, bare ``[x1, y1, x2, y2]`` arrays, and absolute pixel
-    coordinates (normalized via ``image_size`` when they look like pixels).
+    alternate label keys, and bare ``[x1, y1, x2, y2]`` arrays. Coordinates are
+    used as the normalized ``[0, 1]`` values M3 emits.
     """
     fallback = target or "object"
     detections: list[fo.Detection] = []
@@ -401,7 +332,7 @@ def _parse_boxes(
         if coords is None:
             logger.info("[minimax_m3] boxes: skipping item with missing/invalid box: %r", item)
             continue
-        x1, y1, x2, y2 = _to_unit_box(coords, image_size)
+        x1, y1, x2, y2 = coords
         detections.append(
             fo.Detection(label=label, bounding_box=[x1, y1, x2 - x1, y2 - y1])
         )
@@ -410,15 +341,13 @@ def _parse_boxes(
     return fo.Detections(detections=detections)
 
 
-def _parse_points(
-    content: str, *, target: str | None, image_size: tuple[int, int] | None = None
-) -> fo.Keypoints:
+def _parse_points(content: str, *, target: str | None) -> fo.Keypoints:
     """Parse keypoints into Keypoints.
 
     Tolerates wrapper/single-item dicts, items missing a ``label`` key, bare
-    ``[x, y]`` arrays, absolute pixel coordinates (normalized via ``image_size``
-    when they look like pixels), and falls back to box centers when the model
-    returns a box (or a bare 4-number array) instead of a point.
+    ``[x, y]`` arrays, and falls back to box centers when the model returns a
+    box (or a bare 4-number array) instead of a point. Coordinates are used as
+    the normalized ``[0, 1]`` values M3 emits.
     """
     fallback = target or "point"
     keypoints: list[fo.Keypoint] = []
@@ -442,7 +371,7 @@ def _parse_points(
         if xy is None:
             logger.info("[minimax_m3] points: skipping item with no point/box: %r", item)
             continue
-        keypoints.append(fo.Keypoint(label=label, points=[_to_unit_xy(xy, image_size)]))
+        keypoints.append(fo.Keypoint(label=label, points=[[xy[0], xy[1]]]))
 
     logger.info("[minimax_m3] parsed %d keypoint(s)", len(keypoints))
     return fo.Keypoints(keypoints=keypoints)
@@ -726,6 +655,39 @@ def count_label_items(label: Any) -> int:
             return len(label.detections)
         case _:
             return 1
+
+
+def label_items(label: Any) -> list[Any]:
+    """Return the individual label objects inside ``label`` for per-object edits.
+
+    Containers yield their members; a scalar ``Classification`` yields itself;
+    non-label values (e.g. free-text captions) yield ``[]``.
+    """
+    match label:
+        case fo.Detections():
+            return label.detections
+        case fo.Keypoints():
+            return label.keypoints
+        case fo.Classifications():
+            return label.classifications
+        case fo.TemporalDetections():
+            return label.detections
+        case fo.Classification():
+            return [label]
+        case _:
+            return []
+
+
+def attach_provenance(label: Any, provenance: dict[str, Any]) -> None:
+    """Stamp ``provenance`` attributes onto each label object in ``label``.
+
+    Stored per-object (not on the container) so the metadata survives merging
+    multiple runs into one field: each item keeps the prompt / resolution / raw
+    output of the run that produced it. A no-op for free-text labels.
+    """
+    for item in label_items(label):
+        for key, value in provenance.items():
+            item[key] = value
 
 
 def _write_items_to_frames(

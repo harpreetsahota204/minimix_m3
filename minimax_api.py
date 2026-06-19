@@ -7,9 +7,9 @@ Thin OpenAI-compatible client targeted at the Hugging Face Inference router
 * `MiniMaxClient.chat_completion(...)` -- one shot of `/chat/completions` with
   M3's recommended sampling (``temperature=1.0, top_p=0.95, top_k=40``) and the
   ``thinking`` object passed via ``extra_body``. Retries on 429.
-* `encode_image(...)` / `encode_image_with_size(...)` -- base64-encode a local
-  image into the ``data:image/jpeg;base64,...`` URI the API requires (the
-  ``_with_size`` variant also returns the encoded ``(w, h)``).
+* `encode_image(...)` -- base64-encode a local image into the
+  ``data:image/jpeg;base64,...`` URI the API requires, downscaling to
+  ``max_side`` (longest side) unless ``max_side <= 0`` (native resolution).
 * `sample_video_frames(...)` -- evenly sample N frames from a local video with
   OpenCV, returning each frame's timestamp (seconds), 1-indexed frame number,
   and a base64 data URI.
@@ -64,6 +64,15 @@ DEFAULT_TOP_K: Final[int] = 40
 DEFAULT_IMAGE_MAX_SIDE: Final[int] = 1280
 DEFAULT_FRAME_MAX_SIDE: Final[int] = 1024
 
+# Named image-resolution presets surfaced in the chat panel's "Detail" control,
+# keyed by longest-side px (0 = native / no downscale).
+RESOLUTION_NAMES: Final[dict[int, str]] = {0: "native", 1280: "standard", 2048: "high"}
+
+
+def resolution_label(max_side: int) -> str:
+    """Return the human resolution name for an encode size (longest side, px)."""
+    return RESOLUTION_NAMES.get(max_side, f"{max_side}px")
+
 
 # ---------------------------------------------------------------------------
 # Encoding helpers
@@ -71,9 +80,13 @@ DEFAULT_FRAME_MAX_SIDE: Final[int] = 1024
 
 
 def _downscale(img: Image.Image, max_side: int) -> Image.Image:
-    """Downscale ``img`` so its longest side is ``max_side`` px (never upscales)."""
+    """Downscale ``img`` so its longest side is ``max_side`` px (never upscales).
+
+    ``max_side <= 0`` (or falsy) disables downscaling, returning the image at its
+    native resolution.
+    """
     longest = max(img.size)
-    if longest <= max_side:
+    if not max_side or longest <= max_side:
         return img
     scale = max_side / longest
     return img.resize((int(img.size[0] * scale), int(img.size[1] * scale)))
@@ -86,25 +99,16 @@ def _pil_to_jpeg_data_uri(img: Image.Image, *, quality: int = 90) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def encode_image_with_size(
-    filepath: str | Path, *, max_side: int = DEFAULT_IMAGE_MAX_SIDE
-) -> tuple[str, tuple[int, int]]:
-    """Read a local image, downscale, and return ``(jpeg_data_uri, (w, h))``.
-
-    The returned ``(w, h)`` is the size of the *encoded* image the model sees,
-    which the parser needs to normalize any pixel-space coordinates M3 returns.
-    """
-    img = _downscale(Image.open(filepath).convert("RGB"), max_side)
-    return _pil_to_jpeg_data_uri(img), img.size
-
-
 def encode_image(filepath: str | Path, *, max_side: int = DEFAULT_IMAGE_MAX_SIDE) -> str:
     """Read a local image, optionally downscale, and return a JPEG data URI.
 
-    Downscaling to ``max_side`` (longest side) keeps payloads small; M3 returns
-    NORMALIZED coordinates so the resize doesn't affect downstream parsing.
+    Downscaling to ``max_side`` (longest side) keeps payloads small; pass
+    ``max_side <= 0`` to send the image at native resolution (more input detail
+    at the cost of a larger payload). Because M3 returns NORMALIZED coordinates,
+    the resize never affects downstream parsing.
     """
-    return encode_image_with_size(filepath, max_side=max_side)[0]
+    img = _downscale(Image.open(filepath).convert("RGB"), max_side)
+    return _pil_to_jpeg_data_uri(img)
 
 
 def sample_video_frames(
@@ -117,13 +121,11 @@ def sample_video_frames(
 
     Returns ``(frames, fps, total_frames)`` where each ``frames`` entry is::
 
-        {"t": <seconds>, "frame_no": <1-indexed int>, "url": <jpeg data URI>,
-         "w": <encoded px width>, "h": <encoded px height>}
+        {"t": <seconds>, "frame_no": <1-indexed int>, "url": <jpeg data URI>}
 
     The 1-indexed ``frame_no`` matches FiftyOne's frame numbering so callers
-    can write directly to ``sample.frames[frame_no]``; ``w`` / ``h`` are the
-    encoded frame size, used to normalize any pixel-space coordinates M3
-    returns. Mirrors the notebook's ``sample_frames`` helper.
+    can write directly to ``sample.frames[frame_no]``. Mirrors the notebook's
+    ``sample_frames`` helper.
     """
     cap = cv2.VideoCapture(str(filepath))
     try:
@@ -143,8 +145,6 @@ def sample_video_frames(
                     "t": float(i) / fps,
                     "frame_no": int(i) + 1,
                     "url": _pil_to_jpeg_data_uri(img, quality=85),
-                    "w": img.size[0],
-                    "h": img.size[1],
                 }
             )
     finally:
