@@ -4,17 +4,18 @@ Architecture
 ------------
 A hybrid modal panel. Python lifecycle hooks push the current sample's
 filepath and media type to React via ``ctx.panel.set_state()``. The React
-component calls three panel methods:
+component calls two panel methods:
 
     ``ask``             — validates params, starts an inference daemon thread
                           that streams tokens to a file, returns a run_id.
     ``get_stream_chunk``— reads new bytes from the stream file since the
                           caller's last cursor position; React polls every
                           250 ms to produce a live typing effect.
-    ``save_as_label``   — parses the completed stream as JSON using
-                          minimax_parser and saves the resulting FiftyOne label
-                          to the sample. Only offered when the response looked
-                          like a recognised JSON grounding shape.
+
+Converting a response to a FiftyOne label is handled by the ``save_minimax_label``
+operator (see operators.py), which reuses ``save_stream_as_label`` here to parse
+and write the label, then refreshes the App so the overlay appears in the open
+modal. Only offered when the response looked like a recognised JSON shape.
 
 Streaming runs in a daemon thread that writes token chunks to an append-only
 file under ``~/.fiftyone/minimax_chat/`` and lifecycle state to a sibling JSON
@@ -161,6 +162,85 @@ def _append_label(existing: Any, incoming: Any, field: str) -> Any:
     )
 
 
+def _stringify_object_ids(value: Any) -> Any:
+    """Recursively convert BSON ObjectIds to strings.
+
+    The App's sample JSON (what the modal looker renders) uses plain hex-string
+    ids, so a label serialized via ``to_dict()`` must have its ObjectIds
+    stringified before it can be merged into the modal sample client-side.
+    """
+    if isinstance(value, bson.ObjectId):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _stringify_object_ids(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_stringify_object_ids(v) for v in value]
+    return value
+
+
+def save_stream_as_label(
+    dataset: Any,
+    run_id: str,
+    sample_id: str,
+    field: str,
+    fmt: str,
+    frame_rate: Any = None,
+) -> dict:
+    """Parse a completed stream as JSON and write it to a sample as a label.
+
+    On success returns a summary dict including ``field_is_new`` and
+    ``label_json`` -- the saved field serialized to the App's sample-JSON shape
+    so the caller can refresh the open modal in place. Returns ``{"error": ...}``
+    on any failure.
+    """
+    if not run_id:
+        return {"error": "No run_id provided."}
+    if not sample_id:
+        return {"error": "No sample_id provided."}
+    if not field:
+        return {"error": "Field name is required."}
+    if not fmt:
+        return {"error": "No detected format — nothing to convert."}
+
+    stream_file = _stream_path(run_id)
+    if not stream_file.exists():
+        return {"error": (
+            f"Stream file for run '{run_id}' no longer exists. "
+            "Re-ask the question to generate a new stream."
+        )}
+
+    try:
+        content = stream_file.read_text(encoding="utf-8")
+        fr = float(frame_rate) if frame_rate else None
+
+        field_is_new = field not in dataset.get_field_schema()
+        sample = dataset[sample_id]
+
+        # For spatial formats on image samples, pass the encoded image size so
+        # the parser can normalize any pixel-space coordinates M3 emits.
+        image_size = None
+        if fmt in ("box", "point") and getattr(sample, "media_type", "image") != "video":
+            image_size = encode_image_with_size(sample.filepath)[1]
+
+        label = to_fiftyone(content, fmt, frame_rate=fr, image_size=image_size)
+        existing_label = None if field_is_new else sample.get_field(field)
+        label = _append_label(existing_label, label, field)
+
+        sample[field] = label
+        sample.save()
+
+        return {
+            "saved": True,
+            "label_type": type(label).__name__,
+            "count": count_label_items(label),
+            "field": field,
+            "field_is_new": field_is_new,
+            "label_json": _stringify_object_ids(label.to_dict()),
+        }
+    except Exception as exc:
+        return {"error": f"Parse / save failed: {exc}"}
+
+
 # ---------------------------------------------------------------------------
 # Media part construction
 # ---------------------------------------------------------------------------
@@ -252,6 +332,7 @@ class MiniMaxChatPanel(foo.Panel):
             name="minimax_chat",
             label="Ask MiniMax-M3",
             surfaces="modal",
+            icon="/assets/icon.svg",
             help_markdown=(
                 "Ask free-form questions about the current image or video. "
                 "Responses stream live from MiniMax-M3. Use the output hint to "
@@ -415,57 +496,6 @@ class MiniMaxChatPanel(foo.Panel):
             "final_status": status if done else None,
         }
 
-    def save_as_label(self, ctx) -> dict:
-        """Parse a completed stream as JSON and save it as a FiftyOne label."""
-        run_id = ctx.params.get("run_id", "")
-        sample_id = ctx.params.get("sample_id", "")
-        field = (ctx.params.get("field_name") or "").strip()
-        fmt = ctx.params.get("detected_format", "")
-        frame_rate = ctx.params.get("frame_rate")
-
-        if not run_id:
-            return {"error": "No run_id provided."}
-        if not sample_id:
-            return {"error": "No sample_id provided."}
-        if not field:
-            return {"error": "Field name is required."}
-        if not fmt:
-            return {"error": "No detected format — nothing to convert."}
-
-        stream_file = _stream_path(run_id)
-        if not stream_file.exists():
-            return {"error": (
-                f"Stream file for run '{run_id}' no longer exists. "
-                "Re-ask the question to generate a new stream."
-            )}
-
-        try:
-            content = stream_file.read_text(encoding="utf-8")
-            fr = float(frame_rate) if frame_rate else None
-
-            field_is_new = field not in ctx.dataset.get_field_schema()
-            sample = ctx.dataset[sample_id]
-
-            # For spatial formats on image samples, pass the encoded image size
-            # so the parser can normalize any pixel-space coordinates M3 emits.
-            image_size = None
-            if fmt in ("box", "point") and getattr(sample, "media_type", "image") != "video":
-                image_size = encode_image_with_size(sample.filepath)[1]
-
-            label = to_fiftyone(content, fmt, frame_rate=fr, image_size=image_size)
-            existing_label = None if field_is_new else sample.get_field(field)
-            label = _append_label(existing_label, label, field)
-
-            sample[field] = label
-            sample.save()
-
-            label_type = type(label).__name__
-            count = count_label_items(label)
-            return {"saved": True, "label_type": label_type, "count": count, "field": field}
-
-        except Exception as exc:
-            return {"error": f"Parse / save failed: {exc}"}
-
     def render(self, ctx):
         return types.Property(
             types.Object(),
@@ -474,6 +504,5 @@ class MiniMaxChatPanel(foo.Panel):
                 composite_view=True,
                 ask=self.ask,
                 get_stream_chunk=self.get_stream_chunk,
-                save_as_label=self.save_as_label,
             ),
         )

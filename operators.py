@@ -49,6 +49,7 @@ from ._shared import (
     notify,
     task_supports_per_frame,
 )
+from .chat_panel import save_stream_as_label
 from .minimax_model import DEFAULT_MODEL_NAME, DEFAULT_N_FRAMES, MiniMaxModel
 from .minimax_parser import write_per_frame_labels
 from .prompts import Task, default_user_prompt
@@ -723,11 +724,11 @@ def _render_bootstrap_inputs(inputs: Any, ctx: Any, *, media_type: str) -> None:
     if prompt_source == "field":
         _prompt_prefix = (ctx.params.get("bootstrap_prompt_prefix") or "").strip()
         _prompt_field = ctx.params.get("bootstrap_prompt_field") or ""
-        preview_text = f"{_prompt_prefix}<{_prompt_field}>" if _prompt_prefix else f"<{_prompt_field}>"
+        preview = f"{_prompt_prefix}<{_prompt_field}>" if _prompt_prefix else f"<{_prompt_field}>"
         inputs.str(
             "_prompt_preview",
             view=types.MarkdownView(read_only=True),
-            default=f"**Prompt (per sample):** `{preview_text}`",
+            default=f"**Prompt (per sample):** `{preview}`",
         )
     else:
         _raw_target = ctx.params.get("bootstrap_target") or []
@@ -767,14 +768,14 @@ def _render_dense_cost_preview(inputs: Any, ctx: Any) -> None:
     view = ctx.target_view()
     n_videos = len(view)
     total = n_frames * n_videos
-    preview_text = (
+    preview = (
         f"**Cost preview**: ~{n_frames} API call(s) per video across "
         f"**{n_videos}** sample(s) -> **~{total} total call(s)**."
     )
     inputs.str(
         "_dense_cost_preview",
         view=types.MarkdownView(read_only=True, space=12),
-        default=preview_text,
+        default=preview,
     )
 
 
@@ -1359,3 +1360,73 @@ def _derive_field_name(prefix: str, query: str) -> str:
         return prefix
     combined = f"{prefix}_{slug}"
     return combined[:40].rstrip("_") or prefix
+
+
+class SaveMiniMaxLabel(foo.Operator):
+    """Write a chat-panel response to a sample as a FiftyOne label.
+
+    Invoked from the chat panel's "Convert to FiftyOne" button via
+    ``useOperatorExecutor``. Runs in the foreground (never delegated) so
+    ``ctx.ops`` triggers and ``ctx.log`` (browser console) work. The open modal
+    is refreshed in place on the client (handleConvert -> useRefreshSample using
+    the returned ``label_json``), which shows the new overlay without closing
+    the modal so prev/next navigation survives. A brand-new field also reloads
+    the dataset here so the App registers it in the schema/sidebar.
+    """
+
+    version: str = PLUGIN_VERSION
+
+    @property
+    def config(self) -> foo.OperatorConfig:
+        return foo.OperatorConfig(
+            name="save_minimax_label",
+            label="MiniMax-M3: save label",
+            description=(
+                "Save a generated label to a sample so its overlay appears in "
+                "the open modal."
+            ),
+            unlisted=True,
+            allow_immediate_execution=True,
+            allow_delegated_execution=False,
+        )
+
+    def execute(self, ctx: Any) -> dict[str, Any]:
+        run_id = ctx.params.get("run_id", "")
+        sample_id = ctx.params.get("sample_id", "") or ctx.current_sample
+        field = (ctx.params.get("field_name") or "").strip()
+        fmt = ctx.params.get("detected_format", "")
+        frame_rate = ctx.params.get("frame_rate")
+
+        ctx.log(
+            f"[save_minimax_label] params run_id={run_id} sample_id={sample_id} "
+            f"field={field!r} fmt={fmt} frame_rate={frame_rate}"
+        )
+
+        result = save_stream_as_label(
+            ctx.dataset, run_id, sample_id, field, fmt, frame_rate
+        )
+        if result.get("error"):
+            ctx.log(f"[save_minimax_label] write failed: {result['error']}")
+            return result
+
+        ctx.log(
+            f"[save_minimax_label] wrote field={result['field']} "
+            f"type={result['label_type']} count={result['count']} "
+            f"field_is_new={result['field_is_new']}"
+        )
+
+        # A new field changes the dataset schema; reload so the App's sidebar
+        # registers it. The modal sample itself is refreshed client-side, which
+        # keeps the modal open (navigation preserved). A new path only renders
+        # in the modal after a remount, so prompt the user to reopen once.
+        if result["field_is_new"]:
+            ctx.ops.reload_dataset()
+            ctx.log("[save_minimax_label] reload_dataset (new field)")
+            notify(
+                ctx,
+                f"Added new field '{result['field']}'. Close and reopen this "
+                "sample once to display it; further conversions show instantly.",
+                variant="info",
+            )
+
+        return result

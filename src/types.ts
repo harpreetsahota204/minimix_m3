@@ -25,6 +25,9 @@ export interface SaveLabelResult {
   label_type: string;
   count: number;
   field: string;
+  field_is_new?: boolean;
+  /** Saved field serialized to the App sample-JSON shape, for in-place modal refresh. */
+  label_json?: Record<string, unknown>;
 }
 
 /** One turn in the conversation history. */
@@ -54,6 +57,5 @@ export interface PanelSchema {
   view?: {
     ask?: string;
     get_stream_chunk?: string;
-    save_as_label?: string;
   };
 }

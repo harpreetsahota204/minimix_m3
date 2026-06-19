@@ -19,6 +19,7 @@ module.exports = defineConfig({
         "react-dom",
         "@fiftyone/operators",
         "@fiftyone/plugins",
+        "@fiftyone/state",
       ],
       output: {
         globals: {
@@ -26,6 +27,7 @@ module.exports = defineConfig({
           "react-dom":          "ReactDOM",
           "@fiftyone/operators": "__foo__",
           "@fiftyone/plugins":   "__fop__",
+          "@fiftyone/state":     "__fos__",
         },
       },
     },

@@ -1,11 +1,10 @@
 import { useCallback } from "react";
 import { usePanelEvent } from "@fiftyone/operators";
-import type { AskResult, SaveLabelResult, StreamChunk, Turn } from "../types";
+import type { AskResult, StreamChunk, Turn } from "../types";
 
 interface PanelUris {
   ask:              string;
   get_stream_chunk: string;
-  save_as_label:    string;
 }
 
 interface PanelEventResult<T> {
@@ -61,16 +60,5 @@ export function usePanelClient(uris: PanelUris) {
     [call, uris.get_stream_chunk]
   );
 
-  const saveAsLabel = useCallback(
-    (params: {
-      run_id: string;
-      sample_id: string;
-      field_name: string;
-      detected_format: string;
-      frame_rate: number | null;
-    }) => call<SaveLabelResult>("save_as_label", uris.save_as_label, params),
-    [call, uris.save_as_label]
-  );
-
-  return { ask, getStreamChunk, saveAsLabel };
+  return { ask, getStreamChunk };
 }

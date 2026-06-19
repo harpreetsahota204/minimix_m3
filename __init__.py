@@ -36,14 +36,15 @@ from pathlib import Path
 from typing import Any
 
 from .chat_panel import MiniMaxChatPanel
-from .operators import RunMiniMax
+from .operators import RunMiniMax, SaveMiniMaxLabel
 
 logger = logging.getLogger("minimax_m3")
 
 
 def register(plugin) -> None:
-    """Register the RunMiniMax operator and MiniMaxChatPanel."""
+    """Register the operators and the chat panel."""
     plugin.register(RunMiniMax)
+    plugin.register(SaveMiniMaxLabel)
     plugin.register(MiniMaxChatPanel)
 
 

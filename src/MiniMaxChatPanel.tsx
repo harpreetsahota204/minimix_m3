@@ -1,8 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useOperatorExecutor } from "@fiftyone/operators";
+import { useModalSample, useRefreshSample } from "@fiftyone/state";
 import { usePanelClient } from "./hooks/usePanelClient";
-import type { PanelData, PanelSchema, Turn } from "./types";
+import type { PanelData, PanelSchema, SaveLabelResult, Turn } from "./types";
+
+// Operator that writes a converted label and refreshes the open modal.
+const SAVE_LABEL_URI = "@harpreetsahota/minimax-m3/save_minimax_label";
 
 // ---------------------------------------------------------------------------
 // Logging — prefixed for easy filtering in DevTools ([minimax_chat])
@@ -139,9 +144,11 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   const uris = {
     ask:              schema?.view?.ask              ?? "",
     get_stream_chunk: schema?.view?.get_stream_chunk ?? "",
-    save_as_label:    schema?.view?.save_as_label    ?? "",
   };
-  const { ask, getStreamChunk, saveAsLabel } = usePanelClient(uris);
+  const { ask, getStreamChunk } = usePanelClient(uris);
+  const saveLabelExecutor = useOperatorExecutor(SAVE_LABEL_URI);
+  const modalSample = useModalSample();
+  const refreshSample = useRefreshSample();
 
   // Current sample context pushed by Python.
   const [filepath,  setFilepath]  = useState("");
@@ -379,14 +386,49 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     }));
 
     try {
-      const result = await saveAsLabel({
-        run_id:          turn.run_id,
-        sample_id:       sampleId,
-        field_name:      fieldName,
-        detected_format: turn.detected_format,
-        frame_rate:      frameRate,
+      // The save_minimax_label operator writes the field, then refreshes the
+      // open modal (close_sample -> reload_dataset -> set_active_fields ->
+      // open_sample) so the overlay appears without a full-page reload.
+      const result = await new Promise<SaveLabelResult>((resolve, reject) => {
+        saveLabelExecutor.execute(
+          {
+            run_id:          turn.run_id,
+            sample_id:       sampleId,
+            field_name:      fieldName,
+            detected_format: turn.detected_format,
+            frame_rate:      frameRate,
+          },
+          {
+            callback: (res) => {
+              if (res.error) {
+                reject(new Error(errorMessage(res.error, "Save failed.")));
+                return;
+              }
+              const r = res.result as (SaveLabelResult & { error?: string }) | null;
+              if (!r) { reject(new Error("Save failed: operator returned no result.")); return; }
+              if (r.error) { reject(new Error(r.error)); return; }
+              resolve(r);
+            },
+          }
+        );
       });
       log("convert ←", { label_type: result.label_type, count: result.count, field: result.field });
+
+      // Refresh the open modal in place: merge the saved field into the cached
+      // sample and bump the App's refresher. This shows the overlay without
+      // closing the modal, so prev/next navigation survives.
+      const current = modalSample?.sample;
+      if (result.label_json && current && current._id === sampleId) {
+        refreshSample({ ...current, [result.field]: result.label_json });
+        log("convert refresh", { field: result.field, sample_id: sampleId });
+      } else {
+        logError("convert refresh skipped", {
+          has_label_json: Boolean(result.label_json),
+          has_sample:     Boolean(current),
+          sample_match:   current?._id === sampleId,
+        });
+      }
+
       setTurnSaveStates((prev) => ({
         ...prev,
         [turnIdx]: {
@@ -398,9 +440,6 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
           error:          null,
         },
       }));
-      // The open sample modal does not pick up plugin-written labels until
-      // the route reloads; the URL preserves ?id=<sample_id>.
-      window.setTimeout(() => window.location.reload(), 350);
     } catch (e: unknown) {
       const message = errorMessage(e, "Save failed.");
       logError("convert failed", message);
@@ -409,7 +448,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
         [turnIdx]: { ...prev[turnIdx], saving: false, saved: false, error: message },
       }));
     }
-  }, [turnSaveStates, sampleId, frameRate, saveAsLabel]);
+  }, [turnSaveStates, sampleId, frameRate, saveLabelExecutor, modalSample, refreshSample]);
 
   // ── API key warning ───────────────────────────────────────────────────────
   if (data?.api_key_missing) {

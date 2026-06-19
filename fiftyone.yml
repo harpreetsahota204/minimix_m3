@@ -8,6 +8,7 @@ fiftyone:
   version: ">=0.22.0"
 operators:
   - run_minimax
+  - save_minimax_label
 panels:
   - minimax_chat
 secrets:
