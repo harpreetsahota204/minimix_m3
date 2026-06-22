@@ -19,6 +19,13 @@ const IMAGE_RESOLUTIONS: { label: string; value: number }[] = [
   { label: "Native",   value: 0 },
 ];
 
+// Generation-parameter defaults. Mirror the Python panel defaults
+// (chat_panel._PANEL_DEFAULT_MAX_TOKENS and minimax_api M3-recommended sampling).
+const DEFAULT_MAX_TOKENS  = 1500;
+const DEFAULT_TEMPERATURE = 1.0;
+const DEFAULT_TOP_P       = 0.95;
+const DEFAULT_TOP_K       = 40;
+
 // ---------------------------------------------------------------------------
 // Logging — prefixed for easy filtering in DevTools ([minimax_chat])
 // ---------------------------------------------------------------------------
@@ -49,6 +56,11 @@ interface StoredSession {
   imageMaxSide?: number;
   /** Per-format edits to the format instruction; empty unless customized. */
   hintTexts?: Record<string, string>;
+  /** Sampling controls; absent = panel defaults. */
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
+  topK?: number;
 }
 
 function loadSession(sampleId: string): StoredSession | null {
@@ -149,6 +161,42 @@ interface Props {
 }
 
 // ---------------------------------------------------------------------------
+// GenParam — a compact labelled number input for a generation parameter.
+// ---------------------------------------------------------------------------
+
+interface GenParamProps {
+  label:    string;
+  title:    string;
+  value:    number;
+  width:    number;
+  min?:     number;
+  max?:     number;
+  step?:    number;
+  onChange: (n: number) => void;
+}
+
+const GenParam: React.FC<GenParamProps> = ({
+  label, title, value, width, min, max, step, onChange,
+}) => (
+  <label title={title} style={{ display: "flex", alignItems: "center",
+                                gap: 6, fontSize: 11, color: V.muted }}>
+    <span style={{ flexShrink: 0, minWidth: 72, textAlign: "right" as const }}>{label}:</span>
+    <input
+      type="number" value={value} min={min} max={max} step={step}
+      onChange={(e) => {
+        const n = Number(e.target.value);
+        if (!Number.isNaN(n)) onChange(n);
+      }}
+      style={{
+        width, background: V.bg2, color: V.text,
+        border: `1px solid ${V.divider}`, borderRadius: 4,
+        padding: "2px 5px", fontSize: 11, fontFamily: V.font, outline: "none",
+      }}
+    />
+  </label>
+);
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -180,6 +228,14 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   // Per-format edits to the format instruction; absence = use the default.
   const [hintTexts, setHintTexts] = useState<Record<string, string>>({});
   const [hintEditing, setHintEditing] = useState(false);
+  // Generation parameters (shown under the Advanced toggle).
+  const [maxTokens, setMaxTokens] = useState(DEFAULT_MAX_TOKENS);
+  const [temperature, setTemperature] = useState(DEFAULT_TEMPERATURE);
+  const [topP, setTopP] = useState(DEFAULT_TOP_P);
+  const [topK, setTopK] = useState(DEFAULT_TOP_K);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  // Composer focus drives the input pill's focus ring.
+  const [inputFocused, setInputFocused] = useState(false);
 
   // Format-instruction templates are owned by Python (prompts.JSON_SHAPE_BY_FORMAT)
   // and pushed via data.hint_templates — the single source of truth.
@@ -207,6 +263,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   const chunkCountRef = useRef(0);
   const prevSampleKey = useRef("");
   const scrollRef     = useRef<HTMLDivElement>(null);
+  const textareaRef   = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => { ensureStyles(); }, []);
 
@@ -237,6 +294,10 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     setTurnSaveStates({});
     setHintEditing(false);
     setHintTexts({});
+    setMaxTokens(DEFAULT_MAX_TOKENS);
+    setTemperature(DEFAULT_TEMPERATURE);
+    setTopP(DEFAULT_TOP_P);
+    setTopK(DEFAULT_TOP_K);
     runIdRef.current  = "";
     cursorRef.current = 0;
     chunkCountRef.current = 0;
@@ -250,6 +311,10 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
       setNFrames(cached.nFrames ?? 8);
       setImageMaxSide(cached.imageMaxSide ?? DEFAULT_IMAGE_MAX_SIDE);
       setHintTexts(cached.hintTexts ?? {});
+      setMaxTokens(cached.maxTokens ?? DEFAULT_MAX_TOKENS);
+      setTemperature(cached.temperature ?? DEFAULT_TEMPERATURE);
+      setTopP(cached.topP ?? DEFAULT_TOP_P);
+      setTopK(cached.topK ?? DEFAULT_TOP_K);
     } else {
       setTurns([]);
     }
@@ -258,8 +323,12 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   // ── Persist turns ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!sampleId) return;
-    saveSession(sampleId, { turns, enableThinking, hintFormat, nFrames, imageMaxSide, hintTexts });
-  }, [turns, enableThinking, hintFormat, nFrames, imageMaxSide, hintTexts, sampleId]);
+    saveSession(sampleId, {
+      turns, enableThinking, hintFormat, nFrames, imageMaxSide, hintTexts,
+      maxTokens, temperature, topP, topK,
+    });
+  }, [turns, enableThinking, hintFormat, nFrames, imageMaxSide, hintTexts,
+      maxTokens, temperature, topP, topK, sampleId]);
 
   // ── Stream polling ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -329,6 +398,16 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     if (el) el.scrollTop = el.scrollHeight;
   }, [turns.length, streamingText]);
 
+  // ── Auto-grow composer ────────────────────────────────────────────────────
+  // Reflow the textarea to fit its content (single line → multi-line), capped
+  // so a long question scrolls internally rather than swallowing the panel.
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(ta.scrollHeight, 140)}px`;
+  }, [question]);
+
   // ── Send ──────────────────────────────────────────────────────────────────
   const handleSend = useCallback(async () => {
     if (!question.trim() || streamState === "running" || !filepath) return;
@@ -351,7 +430,8 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     log("ask →", { filepath, media_type: mediaType, history_len: historyForApi.length,
                     enable_thinking: enableThinking, hint_format: hintFormat,
                     hint_text_len: currentHintText.length, n_frames: nFrames,
-                    image_max_side: imageMaxSide });
+                    image_max_side: imageMaxSide, max_tokens: maxTokens,
+                    temperature, top_p: topP, top_k: topK });
 
     try {
       const result = await ask({
@@ -364,6 +444,10 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
         hint_text:       currentHintText,
         n_frames:        nFrames,
         image_max_side:  imageMaxSide,
+        max_tokens:      maxTokens,
+        temperature,
+        top_p:           topP,
+        top_k:           topK,
       });
       log("ask ← run_id:", result.run_id);
       runIdRef.current = result.run_id;
@@ -373,7 +457,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
       setStreamError(message);
       setStreamState("error");
     }
-  }, [question, streamState, filepath, mediaType, turns, enableThinking, hintFormat, currentHintText, nFrames, imageMaxSide, ask]);
+  }, [question, streamState, filepath, mediaType, turns, enableThinking, hintFormat, currentHintText, nFrames, imageMaxSide, maxTokens, temperature, topP, topK, ask]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -403,9 +487,11 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     }));
 
     try {
-      // The save_minimax_label operator writes the field, then refreshes the
-      // open modal (close_sample -> reload_dataset -> set_active_fields ->
-      // open_sample) so the overlay appears without a full-page reload.
+      // The save_minimax_label operator writes the field and returns the saved
+      // label as sample-JSON. We then refresh the open modal in place via
+      // useRefreshSample (below) so the overlay appears without a full-page
+      // reload; a brand-new field is registered in the schema by the operator's
+      // reload_dataset() call.
       const result = await new Promise<SaveLabelResult>((resolve, reject) => {
         saveLabelExecutor.execute(
           {
@@ -659,7 +745,8 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
             <input
               type="checkbox" checked={enableThinking}
               onChange={(e) => setEnableThinking(e.target.checked)}
-              style={{ width: 13, height: 13, cursor: "pointer", accentColor: V.primary, flexShrink: 0 }}
+              style={{ width: 13, height: 13, margin: 0, cursor: "pointer",
+                       accentColor: V.primary, flexShrink: 0, verticalAlign: "middle" }}
             />
             Thinking
           </label>
@@ -705,9 +792,26 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
               </select>
             </div>
           )}
+
+          {/* Advanced (generation parameters) toggle */}
+          <button
+            onClick={() => setShowAdvanced((v) => !v)}
+            title="Generation parameters (max tokens, temperature, top-p, top-k)"
+            style={{
+              marginLeft: "auto", background: "none", border: "none",
+              cursor: "pointer", color: showAdvanced ? V.primary : V.muted,
+              fontSize: 11, fontFamily: V.font, display: "flex",
+              alignItems: "center", gap: 4, padding: 0, flexShrink: 0,
+            }}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" />
+            </svg>
+            Advanced
+          </button>
         </div>
 
-        {/* ── Format-instruction preview / editor ── */}
+        {/* ── Format-instruction preview / editor (kept next to Output) ── */}
         {hintFormat === "auto" ? (
           <div style={{ fontSize: 10, color: V.dim, fontStyle: "italic", padding: "0 2px" }}>
             Auto — no format instruction is added; the model decides the output shape.
@@ -777,11 +881,64 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
           </div>
         )}
 
-        <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
+        {/* ── Generation parameters (advanced) — even grid ── */}
+        {showAdvanced && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8,
+                        background: V.bg, border: `1px solid ${V.divider}`,
+                        borderRadius: 6, padding: "8px 10px" }}>
+            <div style={{ display: "grid",
+                          gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                          gap: "7px 16px" }}>
+              <GenParam label="Max tokens" title="Output token ceiling."
+                value={maxTokens} min={1} step={64}
+                onChange={(n) => setMaxTokens(Math.max(1, Math.round(n)))} width={64} />
+              <GenParam label="Temp" title="Sampling temperature (M3 default 1.0)."
+                value={temperature} min={0} max={2} step={0.05}
+                onChange={(n) => setTemperature(Math.max(0, Math.min(2, n)))} width={64} />
+              <GenParam label="Top-p" title="Nucleus-sampling mass (M3 default 0.95)."
+                value={topP} min={0} max={1} step={0.05}
+                onChange={(n) => setTopP(Math.max(0, Math.min(1, n)))} width={64} />
+              <GenParam label="Top-k" title="Top-k sampling (M3 default 40; some providers ignore it)."
+                value={topK} min={1} step={1}
+                onChange={(n) => setTopK(Math.max(1, Math.round(n)))} width={64} />
+            </div>
+            <button
+              onClick={() => {
+                setMaxTokens(DEFAULT_MAX_TOKENS);
+                setTemperature(DEFAULT_TEMPERATURE);
+                setTopP(DEFAULT_TOP_P);
+                setTopK(DEFAULT_TOP_K);
+              }}
+              style={{ alignSelf: "flex-end", background: "none", border: "none",
+                       cursor: "pointer", color: V.dim, fontSize: 10,
+                       textDecoration: "underline", padding: 0, fontFamily: V.font }}
+            >
+              Reset to defaults
+            </button>
+          </div>
+        )}
+
+        <div
+          style={{
+            display: "flex", alignItems: "flex-end", gap: 6,
+            background: V.bg,
+            border: `1px solid ${inputFocused ? V.primary : V.divider}`,
+            borderRadius: 14,
+            padding: "5px 5px 5px 12px",
+            boxShadow: inputFocused
+              ? `0 0 0 3px color-mix(in srgb, ${V.primary} 22%, transparent)`
+              : "none",
+            transition: "border-color 120ms ease, box-shadow 120ms ease",
+            boxSizing: "border-box" as const,
+          }}
+        >
           <textarea
+            ref={textareaRef}
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={handleKeyDown}
+            onFocus={() => setInputFocused(true)}
+            onBlur={() => setInputFocused(false)}
             disabled={streamState === "running"}
             placeholder={
               streamState === "running"
@@ -790,11 +947,13 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
             }
             rows={1}
             style={{
-              flex: 1, background: V.bg, color: streamState === "running" ? V.dim : V.text,
-              border: `1px solid ${V.divider}`, borderRadius: 6,
-              padding: "7px 10px", fontSize: 13, fontFamily: V.font,
-              lineHeight: 1.5, outline: "none", resize: "none" as const,
-              minHeight: 38, overflow: "auto", boxSizing: "border-box" as const,
+              flex: 1, background: "transparent",
+              color: streamState === "running" ? V.dim : V.text,
+              border: "none", outline: "none", resize: "none" as const,
+              padding: "5px 0", margin: 0,
+              fontSize: 13, fontFamily: V.font, lineHeight: 1.5,
+              maxHeight: 140, overflowY: "auto",
+              boxSizing: "border-box" as const,
               cursor: streamState === "running" ? "not-allowed" : "text",
             }}
           />
@@ -802,12 +961,13 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
             onClick={handleSend} disabled={!canSend}
             title="Send (Enter)"
             style={{
-              background: "none", border: "none", padding: "0 2px",
-              cursor:  canSend ? "pointer" : "default",
-              color:   streamState === "running" ? V.muted : canSend ? V.primary : V.dim,
-              opacity: canSend || streamState === "running" ? 1 : 0.35,
-              lineHeight: 1, display: "flex", alignItems: "center",
-              flexShrink: 0, marginBottom: 6,
+              width: 30, height: 30, borderRadius: "50%", flexShrink: 0,
+              border: "none", padding: 0,
+              background: canSend ? V.primary : "transparent",
+              color:      canSend ? V.textInv : V.dim,
+              cursor:     canSend ? "pointer" : "default",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              transition: "background 120ms ease, color 120ms ease",
             }}
           >
             {streamState === "running" ? (
@@ -817,7 +977,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
                 animation: "mmxSpin 0.7s linear infinite", display: "inline-block",
               }} />
             ) : (
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
               </svg>
             )}

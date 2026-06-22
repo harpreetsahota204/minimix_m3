@@ -33,6 +33,9 @@ from ._shared import preview_text
 from .minimax_api import (
     DEFAULT_IMAGE_MAX_SIDE,
     DEFAULT_MODEL_ID,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     MiniMaxClient,
     build_frame_strip_content,
     encode_image,
@@ -64,6 +67,10 @@ TEMPORAL_MAX_TOKENS: int = 1500
 # Kept small to respect provider payload limits (mirrors the notebook).
 DEFAULT_N_FRAMES: int = 8
 
+# Sentinel returned by `predict` when a sample should be skipped entirely (no
+# API call, no label written) -- e.g. its configured ``prompt_field`` is empty.
+SKIP_SAMPLE: Any = object()
+
 
 @dataclass(slots=True, kw_only=True, frozen=True)
 class MiniMaxConfig:
@@ -87,6 +94,11 @@ class MiniMaxConfig:
             ``"enabled"``. ``None`` -> use the task's default.
         max_tokens: Output ceiling per call. ``None`` -> task-appropriate
             default.
+        temperature: Sampling temperature. ``None`` -> M3-recommended default.
+        top_p: Nucleus-sampling probability mass. ``None`` -> M3-recommended
+            default.
+        top_k: Top-k sampling (sent via ``extra_body``). ``None`` ->
+            M3-recommended default.
         n_frames: Frames to sample per video for frame-strip and dense tasks.
         api_key: Explicit HF token. The operator passes ``ctx.secrets["HF_TOKEN"]``;
             the zoo loader / scripts leave it ``None`` to fall back to
@@ -102,6 +114,9 @@ class MiniMaxConfig:
     prompt_field: str | None = None
     thinking: str | None = None
     max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
     n_frames: int = DEFAULT_N_FRAMES
     api_key: str | None = None
 
@@ -124,6 +139,9 @@ class MiniMaxModel(Model):
             prompt_field=cfg_dict.get("prompt_field") or None,
             thinking=cfg_dict.get("thinking") or None,
             max_tokens=cfg_dict.get("max_tokens"),
+            temperature=cfg_dict.get("temperature"),
+            top_p=cfg_dict.get("top_p"),
+            top_k=cfg_dict.get("top_k"),
             n_frames=int(cfg_dict.get("n_frames", DEFAULT_N_FRAMES)),
             api_key=cfg_dict.get("api_key"),
         )
@@ -175,6 +193,18 @@ class MiniMaxModel(Model):
         return DEFAULT_MAX_TOKENS
 
     @property
+    def _temperature(self) -> float:
+        return DEFAULT_TEMPERATURE if self._config.temperature is None else self._config.temperature
+
+    @property
+    def _top_p(self) -> float:
+        return DEFAULT_TOP_P if self._config.top_p is None else self._config.top_p
+
+    @property
+    def _top_k(self) -> int:
+        return DEFAULT_TOP_K if self._config.top_k is None else self._config.top_k
+
+    @property
     def usage_totals(self) -> dict[str, int]:
         return self._client.usage_totals
 
@@ -184,11 +214,21 @@ class MiniMaxModel(Model):
     def predict(self, filepath: str, sample: fo.Sample | None = None) -> FOLabel:
         """Run inference on one media file (image or video).
 
+        Returns ``SKIP_SAMPLE`` (no API call) when a configured ``prompt_field``
+        is empty for this sample; the operator loop treats that as a skip.
+
         Dispatch order:
             1. TASKS_DENSE_FRAME_MODE (FRAME_DETECT) -> ``_predict_dense``.
             2. TASKS_IMAGE_GROUNDING or media_type == "image" -> ``_predict_image``.
             3. Everything else (video shared / temporal) -> ``_predict_video_frames``.
         """
+        if self._should_skip(sample):
+            logger.info(
+                "[minimax_m3] skipping %s: prompt_field=%r is empty/missing",
+                filepath,
+                self._config.prompt_field,
+            )
+            return SKIP_SAMPLE
         if self._config.task in TASKS_DENSE_FRAME_MODE:
             return self._predict_dense(filepath, sample)
         if self._config.task in TASKS_IMAGE_GROUNDING or self._config.media_type == "image":
@@ -287,41 +327,76 @@ class MiniMaxModel(Model):
 
     # -- Internal helpers --------------------------------------------------------
 
-    @staticmethod
-    def _provenance(prompt: str, raw_output: str, *, image: bool) -> dict[str, str]:
+    def _provenance(self, prompt: str, raw_output: str, *, image: bool) -> dict[str, Any]:
         """Provenance attributes stamped on each produced label.
 
-        ``minimax_resolution`` is only meaningful for images (video is
-        frame-sampled, so the image-detail setting doesn't apply).
+        Records the prompt, the raw model output, and the effective generation
+        parameters (each on its own ``minimax_*`` attribute) so every label is
+        self-describing about how it was produced. ``minimax_resolution`` is
+        only meaningful for images (video is frame-sampled, so the image-detail
+        setting doesn't apply).
         """
-        attrs = {"minimax_prompt": prompt, "minimax_raw_output": raw_output}
+        attrs: dict[str, Any] = {
+            "minimax_prompt": prompt,
+            "minimax_raw_output": raw_output,
+            "minimax_thinking": self._thinking,
+            "minimax_max_tokens": self._max_tokens,
+            "minimax_temperature": self._temperature,
+            "minimax_top_p": self._top_p,
+            "minimax_top_k": self._top_k,
+        }
         if image:
             attrs["minimax_resolution"] = resolution_label(DEFAULT_IMAGE_MAX_SIDE)
         return attrs
 
     def _chat(self, content: list[dict[str, Any]]) -> Any:
+        # The resolved properties fold each unset (auto) param to the
+        # M3-recommended default, so the values sent here are exactly the ones
+        # recorded on the label by `_provenance`.
         return self._client.chat_completion(
             model=self._config.model,
             messages=[{"role": "user", "content": content}],
             thinking=self._thinking,
             max_tokens=self._max_tokens,
+            temperature=self._temperature,
+            top_p=self._top_p,
+            top_k=self._top_k,
         )
+
+    def _should_skip(self, sample: fo.Sample | None) -> bool:
+        """Whether this sample should be skipped (no API call, no label).
+
+        True only when a ``prompt_field`` is configured (and not overridden by
+        an explicit ``prompt``) but the field yields no usable text for this
+        sample.
+        """
+        if self._config.prompt or not self._config.prompt_field:
+            return False
+        return not self._field_prompt_text(sample)
+
+    def _field_prompt_text(self, sample: fo.Sample | None) -> str:
+        """Extracted prompt text from the configured ``prompt_field``, or ``""``."""
+        if sample is None:
+            return ""
+        return _extract_prompt_text(sample.get_field(self._config.prompt_field))
 
     def _resolve_prompt(self, sample: fo.Sample | None = None) -> str:
         """Return the user prompt for this request.
 
         Resolution order: explicit ``config.prompt`` > per-sample
         ``config.prompt_field`` (with optional ``prompt_prefix``) > default
-        template from ``prompts.default_user_prompt``.
+        template from ``prompts.default_user_prompt``. Samples whose
+        ``prompt_field`` is empty are skipped upstream (see ``_should_skip``),
+        so the fallback here only guards direct/unexpected calls.
         """
         if self._config.prompt:
             return self._config.prompt
 
         if self._config.prompt_field and sample is not None:
-            field_value = sample.get_field(self._config.prompt_field)
-            if field_value:
+            text = self._field_prompt_text(sample)
+            if text:
                 prefix = self._config.prompt_prefix or ""
-                return f"{prefix}{field_value}"
+                return f"{prefix}{text}"
             logger.warning(
                 "[minimax_m3] sample %s has no value for prompt_field=%r; "
                 "falling back to default prompt",
@@ -340,6 +415,36 @@ class MiniMaxModel(Model):
         meta = sample.metadata if sample is not None else None
         fr = getattr(meta, "frame_rate", None) if meta is not None else None
         return float(fr) if fr else None
+
+
+def _extract_prompt_text(value: Any) -> str:
+    """Best-effort conversion of a sample field value into prompt text.
+
+    Strings pass through; label objects contribute their canonical text -- a
+    ``Classification`` yields its ``label``, the container types yield their
+    members' labels joined (deduped, order-preserving), a ``Regression`` yields
+    its ``value``. Returns ``""`` when nothing usable is present, which the
+    caller treats as a skip signal.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (fo.Classification, fo.Detection, fo.Keypoint, fo.Polyline)):
+        return (value.label or "").strip()
+    if isinstance(value, fo.Classifications):
+        members = value.classifications
+    elif isinstance(value, fo.Detections):
+        members = value.detections
+    elif isinstance(value, fo.Keypoints):
+        members = value.keypoints
+    elif isinstance(value, fo.Polylines):
+        members = value.polylines
+    elif isinstance(value, fo.Regression):
+        return "" if value.value is None else str(value.value)
+    else:
+        return str(value).strip()
+    return ", ".join(dict.fromkeys(m.label for m in members if m.label))
 
 
 def _image_content(prompt: str, image_url: str) -> list[dict[str, Any]]:

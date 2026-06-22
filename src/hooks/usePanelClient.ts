@@ -51,6 +51,10 @@ export function usePanelClient(uris: PanelUris) {
       hint_text: string;
       n_frames: number;
       image_max_side: number;
+      max_tokens: number;
+      temperature: number;
+      top_p: number;
+      top_k: number;
     }) => call<AskResult>("ask", uris.ask, params),
     [call, uris.ask]
   );

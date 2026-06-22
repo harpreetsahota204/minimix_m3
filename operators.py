@@ -50,7 +50,12 @@ from ._shared import (
     task_supports_per_frame,
 )
 from .chat_panel import save_stream_as_label
-from .minimax_model import DEFAULT_MODEL_NAME, DEFAULT_N_FRAMES, MiniMaxModel
+from .minimax_model import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_N_FRAMES,
+    SKIP_SAMPLE,
+    MiniMaxModel,
+)
 from .minimax_parser import write_per_frame_labels
 from .prompts import Task, default_user_prompt
 
@@ -409,7 +414,10 @@ class RunMiniMax(foo.Operator):
             view=thinking_choices,
         )
 
-        # 7. Execution-mode checkbox.
+        # 7. Generation parameters (advanced; blank = per-task defaults).
+        _render_generation_params(inputs)
+
+        # 8. Execution-mode checkbox.
         _render_execution_mode(inputs, ctx)
 
         return types.Property(inputs, view=types.View(label="MiniMax-M3"))
@@ -528,6 +536,61 @@ async def _predict_with_progress(
 # ---------------------------------------------------------------------------
 
 
+def _render_generation_params(inputs: Any) -> None:
+    """Optional sampling controls. Blank fields fall back to per-task defaults.
+
+    Mirrors the OpenAI-compatible knobs M3 honors on the HF router: ``max_tokens``
+    / ``temperature`` / ``top_p`` are standard fields; ``top_k`` is sent via
+    ``extra_body`` (and may be ignored by some providers).
+    """
+    inputs.str(
+        "_gen_params_header",
+        view=types.MarkdownView(read_only=True),
+        default=(
+            "**Generation parameters (advanced)** — leave blank to use the "
+            "recommended per-task defaults."
+        ),
+    )
+    inputs.int(
+        "max_tokens",
+        label="Max new tokens",
+        description="Output token ceiling. Blank = task default (1024; 1500 for temporal).",
+        required=False,
+        min=1,
+    )
+    inputs.float(
+        "temperature",
+        label="Temperature",
+        description="Sampling temperature. Blank = 1.0.",
+        required=False,
+        min=0.0,
+    )
+    inputs.float(
+        "top_p",
+        label="Top-p",
+        description="Nucleus-sampling mass. Blank = 0.95.",
+        required=False,
+        min=0.0,
+        max=1.0,
+    )
+    inputs.int(
+        "top_k",
+        label="Top-k",
+        description="Top-k sampling (via extra_body; some providers ignore it). Blank = 40.",
+        required=False,
+        min=1,
+    )
+
+
+def _render_prompt_preview(inputs: Any, preview: str, *, label: str = "Prompt") -> None:
+    """Render the read-only Markdown prompt-preview line shared by every mode."""
+    inputs.str(
+        "_prompt_preview",
+        view=types.MarkdownView(read_only=True),
+        default=f"**{label}:** `{preview}`",
+    )
+
+
 def _render_frame_sampling(inputs: Any) -> None:
     """``Frames to sample`` control, shown for any frame-sampled video task."""
     inputs.int(
@@ -555,12 +618,7 @@ def _render_event_search_inputs(inputs: Any, ctx: Any) -> None:
 
     query = ctx.params.get("event_query") or ""
     preview_target = query or "<event description>"
-    preview = default_user_prompt(Task.FIND_EVENT, preview_target)
-    inputs.str(
-        "_prompt_preview",
-        view=types.MarkdownView(read_only=True),
-        default=f"**Prompt:** `{preview}`",
-    )
+    _render_prompt_preview(inputs, default_user_prompt(Task.FIND_EVENT, preview_target))
 
     _render_frame_sampling(inputs)
 
@@ -587,12 +645,7 @@ def _render_semantic_search_inputs(inputs: Any, ctx: Any, *, media_type: str) ->
 
     query = ctx.params.get("semantic_query") or ""
     preview_query = query or "<search query>"
-    preview = _SEMANTIC_SEARCH_TEMPLATE.format(query=preview_query)
-    inputs.str(
-        "_prompt_preview",
-        view=types.MarkdownView(read_only=True),
-        default=f"**Prompt:** `{preview}`",
-    )
+    _render_prompt_preview(inputs, _SEMANTIC_SEARCH_TEMPLATE.format(query=preview_query))
 
     if media_type == "video":
         _render_frame_sampling(inputs)
@@ -668,14 +721,19 @@ def _render_bootstrap_inputs(inputs: Any, ctx: Any, *, media_type: str) -> None:
         prompt_source = ctx.params.get("bootstrap_prompt_source", "classes")
 
         if prompt_source == "classes":
-            class_view = types.ListView()
+            # Tokenized "pillbox" input: an AutocompleteView on a List[String]
+            # renders each entry as a chip. allow_user_input lets the user type
+            # arbitrary classes (no predefined choices); no duplicate chips.
             inputs.list(
                 "bootstrap_target",
                 types.String(),
                 label=spec["label"],
                 required=spec.get("required", False),
                 description=spec.get("description", ""),
-                view=class_view,
+                view=types.AutocompleteView(
+                    allow_user_input=True,
+                    allow_duplicates=False,
+                ),
             )
         else:
             inputs.str(
@@ -688,35 +746,33 @@ def _render_bootstrap_inputs(inputs: Any, ctx: Any, *, media_type: str) -> None:
                 ),
                 required=False,
             )
-            str_field_names = sorted(
-                name for name, fld in ctx.dataset.get_field_schema().items()
-                if isinstance(fld, fo.StringField) and not name.startswith("_")
-                and name not in ("id", "filepath")
-            )
-            if str_field_names:
+            eligible_fields = _prompt_source_fields(ctx.dataset)
+            if eligible_fields:
                 field_choices = types.DropdownView()
-                for fn in str_field_names:
-                    field_choices.add_choice(fn, label=fn)
+                for name, type_label in eligible_fields:
+                    field_choices.add_choice(name, label=name, description=type_label)
                 inputs.enum(
                     "bootstrap_prompt_field",
                     field_choices.values(),
-                    default=str_field_names[0],
+                    default=eligible_fields[0][0],
                     required=True,
                     label="Prompt field",
                     description=(
-                        "String field whose value is used as (or appended to the "
-                        "prefix to form) the prompt for each sample."
+                        "Field read per sample to build the prompt (appended to the "
+                        "prefix). String fields use their value; label fields use "
+                        "their label text (e.g. a Detections field -> its class "
+                        "names). Samples with an empty value are skipped."
                     ),
                     view=field_choices,
                 )
             else:
                 inputs.str(
-                    "_no_string_fields_notice",
+                    "_no_eligible_fields_notice",
                     view=types.MarkdownView(read_only=True),
                     default=(
-                        "> **No string fields found.** Add a string field to your "
-                        "dataset first (e.g. `dataset.add_sample_field('my_prompt', "
-                        "fo.StringField())`)."
+                        "> **No eligible fields found.** Add a string field "
+                        "(e.g. `dataset.add_sample_field('my_prompt', "
+                        "fo.StringField())`) or a label field to read prompts from."
                     ),
                 )
 
@@ -725,11 +781,7 @@ def _render_bootstrap_inputs(inputs: Any, ctx: Any, *, media_type: str) -> None:
         _prompt_prefix = (ctx.params.get("bootstrap_prompt_prefix") or "").strip()
         _prompt_field = ctx.params.get("bootstrap_prompt_field") or ""
         preview = f"{_prompt_prefix}<{_prompt_field}>" if _prompt_prefix else f"<{_prompt_field}>"
-        inputs.str(
-            "_prompt_preview",
-            view=types.MarkdownView(read_only=True),
-            default=f"**Prompt (per sample):** `{preview}`",
-        )
+        _render_prompt_preview(inputs, preview, label="Prompt (per sample)")
     else:
         _raw_target = ctx.params.get("bootstrap_target") or []
         if isinstance(_raw_target, list):
@@ -740,11 +792,7 @@ def _render_bootstrap_inputs(inputs: Any, ctx: Any, *, media_type: str) -> None:
         preview_target = target_str or placeholder
         try:
             preview = default_user_prompt(task, preview_target, media_type=media_type)
-            inputs.str(
-                "_prompt_preview",
-                view=types.MarkdownView(read_only=True),
-                default=f"**Prompt:** `{preview}`",
-            )
+            _render_prompt_preview(inputs, preview)
         except ValueError:
             pass
 
@@ -1094,9 +1142,19 @@ async def _execute_bootstrap(
     per_frame = task_supports_per_frame(task)
     mode_label = f"Bootstrap {task.value}"
     model = _build_model(ctx, task=task, target=target)
-    stats = {"frame_labels": 0, "sample_labels": 0, "frames_touched": 0, "dropped": 0}
+    stats = {
+        "frame_labels": 0,
+        "sample_labels": 0,
+        "frames_touched": 0,
+        "dropped": 0,
+        "skipped": 0,
+    }
 
     def on_sample(sample: fo.Sample, label: Any, _i: int) -> str:
+        if label is SKIP_SAMPLE:
+            stats["skipped"] += 1
+            n_labels = stats["frame_labels"] + stats["sample_labels"]
+            return f"{n_labels} label(s) written; {stats['skipped']} skipped"
         frame_rate = _frame_rate(sample) if per_frame else None
         summary = write_per_frame_labels(sample, label, field, frame_rate=frame_rate)
         stats["frame_labels"] += summary["per_frame_count"]
@@ -1105,13 +1163,15 @@ async def _execute_bootstrap(
         stats["dropped"] += summary["dropped"]
         n_labels = stats["frame_labels"] + stats["sample_labels"]
         drop_tail = f"; {stats['dropped']} dropped" if stats["dropped"] else ""
-        return f"{n_labels} label(s) written{drop_tail}"
+        skip_tail = f"; {stats['skipped']} skipped" if stats["skipped"] else ""
+        return f"{n_labels} label(s) written{drop_tail}{skip_tail}"
 
     def finalize(elapsed_s: float) -> _RunOutcome:
         n_frame_labels = stats["frame_labels"]
         n_sample_labels = stats["sample_labels"]
         n_frames_touched = stats["frames_touched"]
         n_dropped = stats["dropped"]
+        n_skipped = stats["skipped"]
         n_labels = n_frame_labels + n_sample_labels
         usage = model.usage_totals
 
@@ -1119,12 +1179,14 @@ async def _execute_bootstrap(
             f"**Bootstrap Labels** ({task.value}) completed.  ",
             f"- Target: `{target or '(none)'}`  ",
             f"- Output field: `{field}`  ",
-            f"- Processed: {total} sample(s)  ",
+            f"- Processed: {total - n_skipped} / {total} sample(s)  ",
             f"- Frame-level labels: **{n_frame_labels}** across {n_frames_touched} frame(s)  ",
             f"- Sample-level labels: **{n_sample_labels}**  ",
             f"- Elapsed: **{_format_elapsed(elapsed_s)}** across **{usage['calls']}** API call(s)  ",
             f"- Tokens: **{usage['prompt_tokens']:,}** in / **{usage['completion_tokens']:,}** out  ",
         ]
+        if n_skipped:
+            summary_md_lines.append(f"- Skipped (empty prompt field): **{n_skipped}**  ")
         if n_dropped:
             summary_md_lines.append(f"- Dropped (no `t=` or missing `frame_rate`): **{n_dropped}**  ")
 
@@ -1148,6 +1210,7 @@ async def _execute_bootstrap(
                 "n_sample_labels": n_sample_labels,
                 "n_frames_touched": n_frames_touched,
                 "n_dropped": n_dropped,
+                "n_skipped": n_skipped,
                 **_usage_summary(model, elapsed_s),
             },
             summary_md="\n".join(summary_md_lines),
@@ -1171,6 +1234,29 @@ async def _execute_bootstrap(
 # ---------------------------------------------------------------------------
 # Module-private helpers.
 # ---------------------------------------------------------------------------
+
+
+def _prompt_source_fields(dataset: Any) -> list[tuple[str, str]]:
+    """Eligible per-sample prompt fields: string fields plus label fields.
+
+    Returns ``(name, type_label)`` pairs sorted by name. Label fields are
+    included because their label text can seed the prompt (a Detections field
+    contributes its class names, a Classification its label, etc. -- see
+    ``minimax_model._extract_prompt_text``).
+    """
+    out: list[tuple[str, str]] = []
+    for name, fld in dataset.get_field_schema().items():
+        if name.startswith("_") or name in ("id", "filepath"):
+            continue
+        if isinstance(fld, fo.StringField):
+            out.append((name, "string"))
+        elif (
+            isinstance(fld, fo.EmbeddedDocumentField)
+            and isinstance(fld.document_type, type)
+            and issubclass(fld.document_type, fo.Label)
+        ):
+            out.append((name, fld.document_type.__name__))
+    return sorted(out)
 
 
 def _resolve_media_type(ctx: Any) -> str:
@@ -1203,6 +1289,11 @@ def _build_model(
         "prompt_prefix": (ctx.params.get("bootstrap_prompt_prefix") or "").strip() or None,
         "prompt_field": ctx.params.get("bootstrap_prompt_field") or None,
         "thinking": None if thinking_param == "auto" else thinking_param,
+        # Optional sampling overrides; left None (auto) when the field is blank.
+        "max_tokens": ctx.params.get("max_tokens"),
+        "temperature": ctx.params.get("temperature"),
+        "top_p": ctx.params.get("top_p"),
+        "top_k": ctx.params.get("top_k"),
         "api_key": get_api_key(ctx),
     }
     if n_frames_param:
@@ -1214,7 +1305,7 @@ def _predict(model: MiniMaxModel, sample: fo.Sample) -> Any:
     try:
         return model.predict(sample.filepath, sample=sample)
     except Exception as exc:
-        exc.add_note(f"While processing sample {sample.id!s} ({sample.filepath})")
+        exc.add_note(f"While processing sample {sample.id} ({sample.filepath})")
         raise
 
 

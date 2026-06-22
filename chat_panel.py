@@ -51,8 +51,10 @@ from .minimax_api import (
     DEFAULT_BASE_URL,
     DEFAULT_IMAGE_MAX_SIDE,
     DEFAULT_MODEL_ID,
+    DEFAULT_TEMPERATURE,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     encode_image,
     frame_parts,
     resolution_label,
@@ -80,6 +82,11 @@ _DEFAULT_FIELDS: dict[str, str] = {
     "temporal": "m3_events",
 }
 
+# Output-token ceiling for the chat panel when the user leaves it on Auto. The
+# panel always sends a frame strip or a single image and may produce JSON, so it
+# gets the more generous temporal-sized budget.
+_PANEL_DEFAULT_MAX_TOKENS: int = 1500
+
 
 def _stream_path(run_id: str) -> Path:
     return _STATUS_DIR / f".stream_{run_id}.txt"
@@ -87,6 +94,10 @@ def _stream_path(run_id: str) -> Path:
 
 def _status_path(run_id: str) -> Path:
     return _STATUS_DIR / f".status_{run_id}.json"
+
+
+def _meta_path(run_id: str) -> Path:
+    return _STATUS_DIR / f".meta_{run_id}.json"
 
 
 def _ensure_dir() -> None:
@@ -114,10 +125,6 @@ def _append_stream(run_id: str, text: str) -> None:
         f.flush()
 
 
-def _meta_path(run_id: str) -> Path:
-    return _STATUS_DIR / f".meta_{run_id}.json"
-
-
 def _clear_run(run_id: str) -> None:
     for p in (_stream_path(run_id), _status_path(run_id), _meta_path(run_id)):
         p.unlink(missing_ok=True)
@@ -126,6 +133,16 @@ def _clear_run(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Format detection (JSON shapes)
 # ---------------------------------------------------------------------------
+
+
+def _num_param(params: Any, key: str, default: Any, *, cast: Any) -> Any:
+    """Read a numeric ``ctx.params`` value, falling back to ``default`` if unset.
+
+    Uses an explicit ``None`` check (not truthiness) so a legitimate ``0`` for
+    ``temperature`` / ``top_p`` is honored rather than replaced by the default.
+    """
+    value = params.get(key)
+    return default if value is None else cast(value)
 
 
 def _detect_format(content: str) -> str | None:
@@ -232,6 +249,11 @@ def save_stream_as_label(
             "minimax_prompt": meta.get("prompt", ""),
             "minimax_raw_output": content,
         }
+        # Stamp each recorded generation parameter as its own attribute (only
+        # those present, so older meta files convert without error).
+        for key in ("thinking", "max_tokens", "temperature", "top_p", "top_k"):
+            if key in meta:
+                provenance[f"minimax_{key}"] = meta[key]
         if getattr(sample, "media_type", "image") != "video" and "image_max_side" in meta:
             provenance["minimax_resolution"] = resolution_label(int(meta["image_max_side"]))
         attach_provenance(label, provenance)
@@ -286,6 +308,11 @@ def _run_stream_thread(
     messages: list[dict[str, Any]],
     thinking: str,
     run_id: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
 ) -> None:
     """Stream an M3 chat completion and write tokens to the stream file."""
     _write_json(_status_path(run_id), {"status": "streaming", "start_time": time.time()})
@@ -297,10 +324,10 @@ def _run_stream_thread(
             messages=messages,
             stream=True,
             stream_options={"include_usage": True},
-            temperature=1.0,
-            top_p=0.95,
-            max_tokens=1500,
-            extra_body={"top_k": DEFAULT_TOP_K, "thinking": {"type": thinking}},
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            extra_body={"top_k": top_k, "thinking": {"type": thinking}},
         )
 
         t0 = time.time()
@@ -350,7 +377,11 @@ class MiniMaxChatPanel(foo.Panel):
             name="minimax_chat",
             label="Ask MiniMax-M3",
             surfaces="modal",
-            icon="/assets/icon.svg",
+            # Panel tabs can only render a Material Icons ligature name -- the
+            # App's panel registration doesn't pass `pluginName` to its icon
+            # component, so a plugin's custom SVG asset path (which works for the
+            # operator button) resolves to nothing here. Use a built-in glyph.
+            icon="auto_awesome",
             help_markdown=(
                 "Ask free-form questions about the current image or video. "
                 "Responses stream live from MiniMax-M3. Use the output hint to "
@@ -426,7 +457,9 @@ class MiniMaxChatPanel(foo.Panel):
         enable_thinking (bool -> adaptive/disabled), hint_format
         ("auto"|"box"|"point"|"temporal"), hint_text (the editable format
         instruction; overrides the default suffix), n_frames, image_max_side
-        (image encode resolution; ``<= 0`` = native).
+        (image encode resolution; ``<= 0`` = native), and the optional sampling
+        controls max_tokens / temperature / top_p / top_k (each ``None`` falls
+        back to the panel default).
         """
         if not has_api_key(ctx):
             return {"error": "HF_TOKEN is not set."}
@@ -440,6 +473,13 @@ class MiniMaxChatPanel(foo.Panel):
         hint_text = (ctx.params.get("hint_text") or "").strip()
         n_frames = int(ctx.params.get("n_frames") or 8)
         image_max_side = int(ctx.params.get("image_max_side", DEFAULT_IMAGE_MAX_SIDE))
+
+        # Optional sampling controls; a missing/None value uses the panel default
+        # (0 is a valid temperature/top_p, so check for None explicitly).
+        max_tokens = _num_param(ctx.params, "max_tokens", _PANEL_DEFAULT_MAX_TOKENS, cast=int)
+        temperature = _num_param(ctx.params, "temperature", DEFAULT_TEMPERATURE, cast=float)
+        top_p = _num_param(ctx.params, "top_p", DEFAULT_TOP_P, cast=float)
+        top_k = _num_param(ctx.params, "top_k", DEFAULT_TOP_K, cast=int)
 
         if not question:
             return {"error": "Question cannot be empty."}
@@ -479,10 +519,19 @@ class MiniMaxChatPanel(foo.Panel):
         run_id = f"{ctx.current_sample or 'x'}_{int(time.time() * 1000)}"
         _clear_run(run_id)
         # Persist provenance so the (separate) convert call can stamp the saved
-        # label with the prompt and image resolution this run actually used.
+        # label with the prompt, image resolution, and generation parameters
+        # this run actually used.
         _write_json(
             _meta_path(run_id),
-            {"prompt": question_to_send, "image_max_side": image_max_side},
+            {
+                "prompt": question_to_send,
+                "image_max_side": image_max_side,
+                "thinking": thinking,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+            },
         )
 
         thread = threading.Thread(
@@ -492,6 +541,10 @@ class MiniMaxChatPanel(foo.Panel):
                 messages=messages,
                 thinking=thinking,
                 run_id=run_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
             ),
             daemon=True,
         )
