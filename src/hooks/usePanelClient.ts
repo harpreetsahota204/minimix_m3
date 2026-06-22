@@ -46,7 +46,7 @@ export function usePanelClient(uris: PanelUris) {
       media_type: string;
       question: string;
       history: Turn[];
-      enable_thinking: boolean;
+      thinking: string;
       hint_format: string;
       hint_text: string;
       n_frames: number;

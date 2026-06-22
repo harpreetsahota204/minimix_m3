@@ -454,7 +454,7 @@ class MiniMaxChatPanel(foo.Panel):
         """Start a streaming inference and return a run_id for React to poll.
 
         Parameters (via ctx.params): filepath, media_type, question, history,
-        enable_thinking (bool -> adaptive/disabled), hint_format
+        thinking ("disabled"|"adaptive"|"enabled"), hint_format
         ("auto"|"box"|"point"|"temporal"), hint_text (the editable format
         instruction; overrides the default suffix), n_frames, image_max_side
         (image encode resolution; ``<= 0`` = native), and the optional sampling
@@ -468,7 +468,9 @@ class MiniMaxChatPanel(foo.Panel):
         media_type = ctx.params.get("media_type", "image")
         question = (ctx.params.get("question") or "").strip()
         history: list[dict] = ctx.params.get("history", [])
-        enable_thinking = bool(ctx.params.get("enable_thinking", False))
+        thinking = ctx.params.get("thinking") or "disabled"
+        if thinking not in ("disabled", "adaptive", "enabled"):
+            thinking = "disabled"
         hint_format = ctx.params.get("hint_format", "auto")
         hint_text = (ctx.params.get("hint_text") or "").strip()
         n_frames = int(ctx.params.get("n_frames") or 8)
@@ -513,8 +515,6 @@ class MiniMaxChatPanel(foo.Panel):
                 media_injected = True
             else:
                 messages.append({"role": turn["role"], "content": turn["content"]})
-
-        thinking = "adaptive" if enable_thinking else "disabled"
 
         run_id = f"{ctx.current_sample or 'x'}_{int(time.time() * 1000)}"
         _clear_run(run_id)

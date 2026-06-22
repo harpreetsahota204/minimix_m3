@@ -19,6 +19,16 @@ const IMAGE_RESOLUTIONS: { label: string; value: number }[] = [
   { label: "Native",   value: 0 },
 ];
 
+// M3 reasoning modes, mirroring the operator form's thinking control (minus the
+// per-task "auto", which has no meaning in free-form chat). Off is the default
+// for the cleanest JSON.
+const DEFAULT_THINKING = "disabled";
+const THINKING_MODES: { label: string; value: string }[] = [
+  { label: "Off",      value: "disabled" },
+  { label: "Adaptive", value: "adaptive" },
+  { label: "Always",   value: "enabled" },
+];
+
 // Generation-parameter defaults. Mirror the Python panel defaults
 // (chat_panel._PANEL_DEFAULT_MAX_TOKENS and minimax_api M3-recommended sampling).
 const DEFAULT_MAX_TOKENS  = 1500;
@@ -49,7 +59,7 @@ const SESSION_PREFIX = "minimaxChat:";
 
 interface StoredSession {
   turns: Turn[];
-  enableThinking: boolean;
+  thinking: string;
   hintFormat: string;
   nFrames: number;
   /** Image encode resolution (longest side, px); 0 = native. */
@@ -197,6 +207,52 @@ const GenParam: React.FC<GenParamProps> = ({
 );
 
 // ---------------------------------------------------------------------------
+// RadioGroup — a compact labelled row of radio options (string or number).
+// Shares GenParam's 72px right-aligned label column so they line up.
+// ---------------------------------------------------------------------------
+
+interface RadioOption<T> {
+  label: string;
+  value: T;
+}
+
+interface RadioGroupProps<T> {
+  label:    string;
+  title:    string;
+  name:     string;
+  value:    T;
+  options:  RadioOption<T>[];
+  onChange: (value: T) => void;
+}
+
+function RadioGroup<T extends string | number>({
+  label, title, name, value, options, onChange,
+}: RadioGroupProps<T>) {
+  return (
+    <div title={title} style={{ display: "flex", alignItems: "center",
+                                 gap: 6, fontSize: 11, color: V.muted }}>
+      <span style={{ flexShrink: 0, minWidth: 72, textAlign: "right" as const }}>{label}:</span>
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap" as const }}>
+        {options.map((o) => (
+          <label key={String(o.value)}
+                 style={{ display: "flex", alignItems: "center", gap: 4,
+                          cursor: "pointer", userSelect: "none" }}>
+            <input
+              type="radio" name={name}
+              checked={value === o.value}
+              onChange={() => onChange(o.value)}
+              style={{ width: 12, height: 12, margin: 0, cursor: "pointer",
+                       accentColor: V.primary, flexShrink: 0 }}
+            />
+            {o.label}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -219,7 +275,8 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   // Conversation turns.
   const [turns,    setTurns]    = useState<Turn[]>([]);
   const [question, setQuestion] = useState("");
-  const [enableThinking, setEnableThinking] = useState(false);
+  // M3 reasoning mode: "disabled" | "adaptive" | "enabled".
+  const [thinking, setThinking] = useState(DEFAULT_THINKING);
   // "auto" = let the model decide; other values append a JSON-shape suffix.
   const [hintFormat, setHintFormat] = useState("auto");
   const [nFrames, setNFrames] = useState(8);
@@ -306,7 +363,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
     if (cached) {
       log("restored session", { sample_id: newId, turns: cached.turns.length });
       setTurns(cached.turns);
-      setEnableThinking(cached.enableThinking);
+      setThinking(cached.thinking ?? DEFAULT_THINKING);
       setHintFormat(cached.hintFormat ?? "auto");
       setNFrames(cached.nFrames ?? 8);
       setImageMaxSide(cached.imageMaxSide ?? DEFAULT_IMAGE_MAX_SIDE);
@@ -324,10 +381,10 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
   useEffect(() => {
     if (!sampleId) return;
     saveSession(sampleId, {
-      turns, enableThinking, hintFormat, nFrames, imageMaxSide, hintTexts,
+      turns, thinking, hintFormat, nFrames, imageMaxSide, hintTexts,
       maxTokens, temperature, topP, topK,
     });
-  }, [turns, enableThinking, hintFormat, nFrames, imageMaxSide, hintTexts,
+  }, [turns, thinking, hintFormat, nFrames, imageMaxSide, hintTexts,
       maxTokens, temperature, topP, topK, sampleId]);
 
   // ── Stream polling ────────────────────────────────────────────────────────
@@ -428,7 +485,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
 
     // currentHintText is already "" when hintFormat is "auto".
     log("ask →", { filepath, media_type: mediaType, history_len: historyForApi.length,
-                    enable_thinking: enableThinking, hint_format: hintFormat,
+                    thinking, hint_format: hintFormat,
                     hint_text_len: currentHintText.length, n_frames: nFrames,
                     image_max_side: imageMaxSide, max_tokens: maxTokens,
                     temperature, top_p: topP, top_k: topK });
@@ -439,7 +496,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
         media_type:      mediaType,
         question:        q,
         history:         historyForApi,
-        enable_thinking: enableThinking,
+        thinking,
         hint_format:     hintFormat,
         hint_text:       currentHintText,
         n_frames:        nFrames,
@@ -457,7 +514,7 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
       setStreamError(message);
       setStreamState("error");
     }
-  }, [question, streamState, filepath, mediaType, turns, enableThinking, hintFormat, currentHintText, nFrames, imageMaxSide, maxTokens, temperature, topP, topK, ask]);
+  }, [question, streamState, filepath, mediaType, turns, thinking, hintFormat, currentHintText, nFrames, imageMaxSide, maxTokens, temperature, topP, topK, ask]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -738,19 +795,6 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
             </select>
           </div>
 
-          {/* Thinking toggle (off = disabled, on = adaptive) */}
-          <label style={{ display: "flex", alignItems: "center", gap: 6,
-                           cursor: "pointer", userSelect: "none",
-                           fontSize: 11, color: V.muted }}>
-            <input
-              type="checkbox" checked={enableThinking}
-              onChange={(e) => setEnableThinking(e.target.checked)}
-              style={{ width: 13, height: 13, margin: 0, cursor: "pointer",
-                       accentColor: V.primary, flexShrink: 0, verticalAlign: "middle" }}
-            />
-            Thinking
-          </label>
-
           {/* Frames-to-sample (video only) */}
           {mediaType === "video" && (
             <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: V.muted }}>
@@ -767,36 +811,10 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
             </div>
           )}
 
-          {/* Image resolution (image only) — higher = more detail for small objects */}
-          {mediaType === "image" && (
-            <div
-              title="Resolution sent to M3 (longest side). Higher helps small objects; Native sends full resolution."
-              style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: V.muted }}
-            >
-              <span style={{ flexShrink: 0 }}>Detail:</span>
-              <select
-                value={imageMaxSide}
-                onChange={(e) => setImageMaxSide(Number(e.target.value))}
-                style={{
-                  background: V.bg2, color: V.text,
-                  border: `1px solid ${V.divider}`, borderRadius: 4,
-                  padding: "2px 5px", fontSize: 11, fontFamily: V.font,
-                  cursor: "pointer", outline: "none",
-                }}
-              >
-                {IMAGE_RESOLUTIONS.map((r) => (
-                  <option key={r.value} value={r.value}>
-                    {r.label}{r.value > 0 ? ` (${r.value}px)` : ""}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-
-          {/* Advanced (generation parameters) toggle */}
+          {/* Advanced settings toggle (reasoning, detail, sampling) */}
           <button
             onClick={() => setShowAdvanced((v) => !v)}
-            title="Generation parameters (max tokens, temperature, top-p, top-k)"
+            title="Advanced settings (reasoning, detail, sampling)"
             style={{
               marginLeft: "auto", background: "none", border: "none",
               cursor: "pointer", color: showAdvanced ? V.primary : V.muted,
@@ -881,11 +899,25 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
           </div>
         )}
 
-        {/* ── Generation parameters (advanced) — even grid ── */}
+        {/* ── Advanced settings (reasoning, detail, sampling) ── */}
         {showAdvanced && (
           <div style={{ display: "flex", flexDirection: "column", gap: 8,
                         background: V.bg, border: `1px solid ${V.divider}`,
                         borderRadius: 6, padding: "8px 10px" }}>
+            <RadioGroup<string>
+              label="Thinking" name="mmx-thinking" value={thinking}
+              title="M3 reasoning. Off is fastest and cleanest for JSON; Adaptive lets the model decide; Always forces reasoning."
+              options={THINKING_MODES} onChange={setThinking}
+            />
+            {mediaType === "image" && (
+              <RadioGroup<number>
+                label="Detail" name="mmx-detail" value={imageMaxSide}
+                title="Resolution sent to M3 (longest side). Higher helps small objects; Native sends full resolution."
+                options={IMAGE_RESOLUTIONS}
+                onChange={setImageMaxSide}
+              />
+            )}
+            <div style={{ height: 1, background: V.divider, margin: "1px 0" }} />
             <div style={{ display: "grid",
                           gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
                           gap: "7px 16px" }}>
@@ -904,6 +936,8 @@ const MiniMaxChatPanel: React.FC<Props> = ({ data, schema }) => {
             </div>
             <button
               onClick={() => {
+                setThinking(DEFAULT_THINKING);
+                setImageMaxSide(DEFAULT_IMAGE_MAX_SIDE);
                 setMaxTokens(DEFAULT_MAX_TOKENS);
                 setTemperature(DEFAULT_TEMPERATURE);
                 setTopP(DEFAULT_TOP_P);
